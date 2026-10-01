@@ -96,7 +96,7 @@ if (ARGV[1] == '' and not current) or current == ARGV[1] then
     redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
     redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
     if ARGV[4] ~= '' then
-        redis.call('SADD', KEYS[3], ARGV[4])
+        redis.call('SADD', KEYS[3], ARGV[4], ARGV[5])
         redis.call('EXPIRE', KEYS[3], ARGV[3])
     end
     return 1
@@ -139,6 +139,7 @@ class RedisHostedGrantStore:
             grant.model_dump_json(),
             ttl,
             previous.refresh_hash if previous is not None else "",
+            previous.access_hash if previous is not None else "",
         )
         return isinstance(result, int) and result == 1
 
@@ -207,7 +208,13 @@ class HostedProxyAuth:
         )
 
     async def _read(
-        self, token: str, prefix: str, client_id: str | None, resource: str | None
+        self,
+        token: str,
+        prefix: str,
+        client_id: str | None,
+        resource: str | None,
+        *,
+        purpose: Literal["authenticate", "revoke"] = "authenticate",
     ) -> HostedGrant | HostedFailure:
         grant_id: Final = _grant_id(token, prefix)
         if grant_id is None:
@@ -222,14 +229,14 @@ class HostedProxyAuth:
         expires: Final = grant.expires_at if prefix == HOSTED_REFRESH_PREFIX else grant.access_expires_at
         if (
             grant.grant_id != grant_id
-            or self._now >= expires
+            or (self._now >= expires and purpose != "revoke")
             or self._now >= grant.expires_at
             or (client_id is not None and client_id != grant.client_id)
             or (resource is not None and resource != grant.resource)
         ):
             return HostedFailure()
         if not hmac.compare_digest(_digest(token), expected):
-            if prefix == HOSTED_REFRESH_PREFIX:
+            if prefix == HOSTED_REFRESH_PREFIX or purpose == "revoke":
                 try:
                     await self._store.revoke_replayed(grant_id, _digest(token))
                 except Exception:  # noqa: BLE001  # a failed replay revocation must not be hidden
@@ -307,7 +314,7 @@ class HostedProxyAuth:
 
     async def revoke(self, token: str, client_id: str) -> HostedFailure | None:
         prefix: Final = HOSTED_REFRESH_PREFIX if token.startswith(HOSTED_REFRESH_PREFIX) else HOSTED_ACCESS_PREFIX
-        grant: Final = await self._read(token, prefix, client_id, None)
+        grant: Final = await self._read(token, prefix, client_id, None, purpose="revoke")
         if isinstance(grant, HostedFailure):
             return grant if grant.error == "temporarily_unavailable" else None
         try:
@@ -331,10 +338,20 @@ async def load_hosted_user(user_id: str, team_id: str | None) -> UserAPIKeyAuth 
         fetch_cli_sso_team_details,  # noqa: PLC0415  # existing live team selection rules
     )
     from litellm.proxy.proxy_server import (  # noqa: PLC0415  # startup-owned dependencies
+        general_settings,
         prisma_client,
         user_api_key_cache,
+        user_custom_auth,
     )
 
+    if (
+        user_custom_auth is not None
+        or general_settings.get("enable_oauth2_auth") is True
+        or general_settings.get("enable_oauth2_proxy_auth") is True
+    ):
+        return HostedFailure(
+            description="hosted application authorization is disabled while custom or external auth is configured"
+        )
     user: Final = await load_active_user_by_id(user_id, source="database")
     if isinstance(user, str):
         return _unavailable() if user in ("unavailable", "unresolvable", "faulted") else HostedFailure()

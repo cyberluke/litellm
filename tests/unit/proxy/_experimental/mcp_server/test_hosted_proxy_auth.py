@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Final
 
 import pytest
+from fastapi import HTTPException, Request
 
+from litellm.proxy import proxy_server
 from litellm.proxy._experimental.mcp_server.hosted_proxy_auth import (
     HOSTED_ACCESS_TTL,
     HOSTED_GRANT_TTL,
@@ -13,6 +15,10 @@ from litellm.proxy._experimental.mcp_server.hosted_proxy_auth import (
     HostedGrant,
     HostedProxyAuth,
     HostedTokens,
+    authenticate_hosted_request,
+    hosted_proxy_auth,
+    hosted_redirect_is_allowed,
+    load_hosted_user,
 )
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 
@@ -27,6 +33,7 @@ class GrantStore:
         self.issued: bool = False
         self.spent: frozenset[str] = frozenset()
         self.available: bool = True
+        self.revocation_available: bool = True
 
     async def read(self, grant_id: str) -> HostedGrant | HostedFailure:
         if not self.available:
@@ -39,19 +46,19 @@ class GrantStore:
         if self.grant != previous or (previous is None and self.issued):
             return False
         if previous is not None:
-            self.spent = self.spent | frozenset({previous.refresh_hash})
+            self.spent = self.spent | frozenset({previous.refresh_hash, previous.access_hash})
         self.grant = grant
         self.issued = True
         return True
 
     async def delete(self, grant_id: str) -> None:
-        if not self.available:
+        if not self.available or not self.revocation_available:
             raise ConnectionError("store unavailable")
         if self.grant is not None and self.grant.grant_id == grant_id:
             self.grant = None
 
     async def revoke_replayed(self, grant_id: str, token_hash: str) -> None:
-        if not self.available:
+        if not self.available or not self.revocation_available:
             raise ConnectionError("store unavailable")
         if token_hash in self.spent:
             await self.delete(grant_id)
@@ -79,6 +86,58 @@ async def issued(service: HostedProxyAuth) -> HostedTokens:
     return result
 
 
+@pytest.mark.parametrize(
+    "callback",
+    [
+        "http://admin.example/callback",
+        "https://user:password@admin.example/callback",
+        "https://[bad",
+        "https://admin.example/#x",
+    ],
+)
+def test_allowlisting_does_not_make_an_unsafe_callback_trusted(monkeypatch: pytest.MonkeyPatch, callback: str) -> None:
+    monkeypatch.setenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS", callback)
+    assert not hosted_redirect_is_allowed(callback)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["custom_auth", "enable_oauth2_auth", "enable_oauth2_proxy_auth"])
+async def test_exclusive_authorization_configuration_denies_hosted_identity(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    async def custom_policy(request: Request, api_key: str) -> UserAPIKeyAuth:
+        raise HTTPException(status_code=403, detail="custom policy denied access")
+
+    monkeypatch.setattr(proxy_server, "user_custom_auth", custom_policy if mode == "custom_auth" else None)
+    monkeypatch.setattr(proxy_server, "general_settings", {mode: True} if mode != "custom_auth" else {})
+    result: Final = await load_hosted_user("user", None)
+    assert isinstance(result, HostedFailure)
+    assert result.error == "invalid_grant"
+    assert "custom or external auth is configured" in result.description
+
+
+@pytest.mark.asyncio
+async def test_missing_database_prevents_loading_hosted_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(proxy_server, "user_custom_auth", None)
+    monkeypatch.setattr(proxy_server, "general_settings", {})
+    result: Final = await load_hosted_user("user", None)
+    assert isinstance(result, HostedFailure)
+    assert result.error == "temporarily_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_missing_shared_redis_prevents_service_and_api_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proxy_server, "redis_usage_cache", None)
+    service: Final = hosted_proxy_auth()
+    assert isinstance(service, HostedFailure)
+    assert service.error == "temporarily_unavailable"
+    request: Final = Request({"type": "http", "method": "GET", "path": "/v1/models", "headers": []})
+    with pytest.raises(HTTPException) as denied:
+        await authenticate_hosted_request(request, "llm_hosted_invalid", "/v1/models")
+    assert denied.value.status_code == 503
+
+
 @pytest.mark.asyncio
 async def test_tokens_are_opaque_and_only_hashes_are_stored() -> None:
     store: Final = GrantStore()
@@ -92,6 +151,40 @@ async def test_tokens_are_opaque_and_only_hashes_are_stored() -> None:
     assert tokens.scope == "proxy:read"
     assert tokens.access_token not in repr(tokens)
     assert tokens.refresh_token not in repr(tokens)
+
+
+@pytest.mark.asyncio
+async def test_issuance_rejects_removed_callback_and_inactive_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    store: Final = GrantStore()
+    loader: Final = UserLoader()
+    service: Final = HostedProxyAuth(store, loader, NOW)
+    monkeypatch.delenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS")
+    assert isinstance(await service.issue("user", "team", "client", CALLBACK, RESOURCE, "code-id"), HostedFailure)
+    monkeypatch.setenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS", CALLBACK)
+    loader.active = False
+    assert isinstance(await service.issue("user", "team", "client", CALLBACK, RESOURCE, "code-id"), HostedFailure)
+    assert store.grant is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", [False, True])
+async def test_failed_revocation_is_retryable_and_never_reports_success(replay: bool) -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    rotated: Final = await service.refresh(tokens.refresh_token, "client", RESOURCE)
+    assert isinstance(rotated, HostedTokens)
+    store.revocation_available = False
+    failure: Final = (
+        await service.refresh(tokens.refresh_token, "client", RESOURCE)
+        if replay
+        else await service.revoke(rotated.refresh_token, "client")
+    )
+    assert isinstance(failure, HostedFailure)
+    assert failure.error == "temporarily_unavailable"
+    store.revocation_available = True
+    assert await service.revoke(rotated.refresh_token, "client") is None
+    assert isinstance(await service.refresh(rotated.refresh_token, "client", RESOURCE), HostedFailure)
 
 
 @pytest.mark.asyncio
@@ -241,7 +334,28 @@ async def test_refresh_history_is_bounded() -> None:
     response: Final = await service.refresh(rotated.refresh_token, "client", RESOURCE)
     assert isinstance(response, HostedFailure)
     assert response.error == "invalid_grant"
-    assert store.spent == frozenset({hashlib.sha256(tokens.refresh_token.encode()).hexdigest()})
+    assert store.spent == frozenset(
+        hashlib.sha256(token.encode()).hexdigest() for token in (tokens.refresh_token, tokens.access_token)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotated", [False, True])
+async def test_expired_or_rotated_access_can_revoke_the_entire_grant(rotated: bool) -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    current: Final = await service.refresh(tokens.refresh_token, "client", RESOURCE) if rotated else tokens
+    assert isinstance(current, HostedTokens)
+    later: Final = HostedProxyAuth(store, UserLoader(), NOW + timedelta(seconds=HOSTED_ACCESS_TTL))
+    forged: Final = tokens.access_token[:-43] + "x" * 43
+    assert await later.revoke(forged, "client") is None
+    assert store.grant is not None
+    assert await later.revoke(tokens.access_token, "different-client") is None
+    assert store.grant is not None
+    assert await later.revoke(tokens.access_token, "client") is None
+    assert store.grant is None
+    assert isinstance(await later.refresh(current.refresh_token, "client", RESOURCE), HostedFailure)
 
 
 @pytest.mark.asyncio
