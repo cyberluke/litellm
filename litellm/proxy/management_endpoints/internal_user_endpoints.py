@@ -47,15 +47,17 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     object_permission_cache_key,
     user_object_permission_id_cache_key,
 )
+from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.model_max_budget_limiter import build_model_max_budget_usage
 from litellm.proxy.hooks.user_management_event_hooks import UserManagementEventHooks
+from litellm.proxy.management.teams.access import is_team_admin
 from litellm.proxy.management_endpoints.common_daily_activity import (
     DailySpendRecord,
     get_daily_activity,
     get_daily_activity_aggregated,
 )
 from litellm.proxy.management_endpoints.common_utils import (
-    _is_user_team_admin,
     _user_has_admin_view,
     require_caller_user_id_for_non_admin,
     validate_budget_duration,
@@ -179,7 +181,10 @@ def _team_membership_table(
 
 
 async def _hash_password_in_dict(
-    data: dict, general_settings: Mapping[str, object], password_prevalidated: bool = False
+    data: dict,
+    general_settings: Mapping[str, object],
+    password_prevalidated: bool = False,
+    hibp_client: AsyncHTTPHandler | None = None,
 ) -> None:
     """Validate and hash password field in-place if present.
 
@@ -191,7 +196,7 @@ async def _hash_password_in_dict(
     if "password" in data and data["password"] is not None:
         if not password_prevalidated:
             validate_password_policy(data["password"], general_settings)
-            await validate_password_not_breached(data["password"], general_settings)
+            await validate_password_not_breached(data["password"], general_settings, hibp_client)
         data["password"] = hash_password(data["password"])
         data["password_reset_required"] = True
         data["last_breach_check_at"] = None
@@ -1050,7 +1055,7 @@ async def _check_user_info_v2_access(
             teams: Final = await _team_table(prisma_client).find_many(where={"team_id": {"in": caller_user.teams}})
             for team in teams:
                 team_obj = LiteLLM_TeamTable.model_validate(team.model_dump())
-                if _is_user_team_admin(user_api_key_dict=user_api_key_dict, team_obj=team_obj):
+                if is_team_admin(user_api_key_dict=user_api_key_dict, team_obj=team_obj):
                     # Check if target user is in this team
                     if team.team_id in (target_user.teams or []):
                         return target_user
@@ -1457,6 +1462,7 @@ async def _update_single_user_helper(
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None = None,
     password_prevalidated: bool = False,
+    hibp_client: AsyncHTTPHandler | None = None,
 ) -> dict[str, Any]:
     """
     Helper function to update a single user.
@@ -1479,7 +1485,12 @@ async def _update_single_user_helper(
 
     data_json: Final[dict] = user_request.model_dump(exclude_unset=True)
     non_default_values = _update_internal_user_params(data_json=data_json, data=user_request)
-    await _hash_password_in_dict(non_default_values, general_settings, password_prevalidated=password_prevalidated)
+    await _hash_password_in_dict(
+        non_default_values,
+        general_settings,
+        password_prevalidated=password_prevalidated,
+        hibp_client=hibp_client,
+    )
 
     existing_user_row: BaseModel | None = None
     if user_request.user_id:
@@ -1581,6 +1592,23 @@ async def _update_single_user_helper(
             response = inserted_user_row  # pyright: ignore[reportAssignmentType]  # insert_data returns a prisma row
 
     if response is not None:
+        if "password" in non_default_values:
+            # An admin set this user's password, which implies the old one may be
+            # compromised; kill every existing UI session for the target. Revoke-all
+            # (no keep) — the caller is the admin, not the target, so the caller's
+            # own session is not among these.
+            from litellm.proxy.management_endpoints.session_endpoints import (
+                revoke_ui_session_keys,
+            )
+
+            target_user_id: Final = non_default_values.get("user_id")
+            if isinstance(target_user_id, str):
+                await revoke_ui_session_keys(
+                    user_id=target_user_id,
+                    user_api_key_dict=user_api_key_dict,
+                    litellm_changed_by=litellm_changed_by,
+                )
+
         await _schedule_user_update_audit_log(
             response=response,
             existing_user_row=existing_user_row,
@@ -2538,6 +2566,12 @@ async def delete_user(
         prisma_client=prisma_client,
     )
     await _verification_token_table(prisma_client).delete_many(where=key_filter)
+    if keys_to_delete:
+        KeyManagementEventHooks.create_key_deleted_audit_logs(
+            keys_being_deleted=keys_to_delete,
+            user_api_key_dict=user_api_key_dict,
+            litellm_changed_by=litellm_changed_by,
+        )
     await delete_cache_key_objects(
         hashed_tokens=hashed_tokens_to_delete,
         user_api_key_cache=user_api_key_cache,
@@ -2689,8 +2723,6 @@ async def _resolve_team_org_filter(
     proxy_logging_obj: "ProxyLogging | None",
 ) -> list[str]:
     """Look up the team and return its org as a filter list, or raise 403."""
-    from litellm.proxy.management_endpoints.common_utils import _is_user_team_admin
-
     try:
         team_obj: Final = await get_team_object(
             team_id=team_id,
@@ -2704,7 +2736,7 @@ async def _resolve_team_org_filter(
             detail={"error": f"scope_user_search_to_org is enabled but team '{team_id}' was not found."},
         )
 
-    if not _is_user_team_admin(user_api_key_dict, team_obj):
+    if not is_team_admin(user_api_key_dict, team_obj):
         raise HTTPException(
             status_code=403,
             detail={"error": "scope_user_search_to_org is enabled. You must be an admin of this team to search users."},
@@ -2733,6 +2765,10 @@ async def _resolve_team_org_filter(
 async def ui_view_users(
     user_id: str | None = fastapi.Query(default=None, description="User ID in the request parameters"),
     user_email: str | None = fastapi.Query(default=None, description="User email in the request parameters"),
+    search: str | None = fastapi.Query(
+        default=None,
+        description="Combined search: matches users whose 'user_id' or 'user_email' contains the value (case-insensitive).",
+    ),
     team_id: str | None = fastapi.Query(
         default=None,
         description="Team ID — used when a team admin searches for users to add to their team",
@@ -2742,7 +2778,7 @@ async def ui_view_users(
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
-    Filter users based on partial match of user_id or email with pagination.
+    Filter users based on partial match of user_id or email, or combined ``search``, with pagination.
 
     Behaviour depends on the ``scope_user_search_to_org`` UI-setting flag
     (stored in the ``litellm_uisettings`` table):
@@ -2794,9 +2830,15 @@ async def ui_view_users(
         if org_filter_ids is not None:
             where_conditions["organization_memberships"] = {"some": {"organization_id": {"in": org_filter_ids}}}
 
+        where: Final[Mapping[str, object]] = {  # mutable-ok: prisma serializes `where`, keep it a plain dict
+            key: value
+            for key, value in (*where_conditions.items(), *_user_search_where(search).items())
+            if value is not None
+        }
+
         # Query users with pagination and filters
         users: Final = await _user_table(prisma_client).find_many(
-            where=where_conditions,
+            where=where,
             skip=skip,
             take=page_size,
             order={"created_at": "desc"},
@@ -2810,6 +2852,9 @@ async def ui_view_users(
     except HTTPException:
         raise
     except Exception as e:
+        if PrismaDBExceptionHandler.is_database_service_unavailable_error_in_chain(e):
+            verbose_proxy_logger.warning("Database unavailable during user search: %s", type(e).__name__)
+            raise PrismaDBExceptionHandler.service_unavailable_proxy_exception(e) from e
         verbose_proxy_logger.exception("Error searching users: %s", e)
         raise HTTPException(status_code=500, detail=f"Error searching users: {e}")
 

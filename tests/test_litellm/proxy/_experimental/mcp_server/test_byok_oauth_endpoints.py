@@ -13,6 +13,7 @@ Covers:
 import base64
 import hashlib
 import json
+import re
 import time
 import uuid
 from typing import Any, Optional
@@ -216,6 +217,29 @@ def test_authorize_get_returns_html(client):
     # Hidden fields should be embedded
     assert "my-server" in resp.text
     assert "abc123" in resp.text
+
+
+def test_authorize_page_logo_is_served_by_the_proxy(client):
+    from litellm.proxy.proxy_server import app
+
+    page = client.get(
+        "/v1/mcp/oauth/authorize",
+        params={
+            "client_id": "test-client",
+            "redirect_uri": "http://127.0.0.1:3000/callback",
+            "response_type": "code",
+            "code_challenge": "abc123",
+            "code_challenge_method": "S256",
+            "state": "xyz",
+            "server_id": "my-server",
+        },
+        follow_redirects=False,
+    )
+    logo_src = re.search(r'<img src="([^"]+)" class="logo-img"', page.text).group(1)
+
+    logo = TestClient(app).get(logo_src, follow_redirects=False)
+
+    assert (logo.status_code, logo.headers["content-type"].split(";")[0].startswith("image/")) == (200, True)
 
 
 def test_authorize_get_missing_redirect_uri(client):
@@ -901,6 +925,61 @@ def test_authorize_post_accepts_ui_session_cookie(unauthenticated_client):
     qs = parse_qs(urlparse(resp.headers["location"]).query)
     code = qs["code"][0]
     assert _byok_auth_codes[code]["user_id"] == "browser-user-42"
+
+
+def test_authorize_post_rejects_cookie_with_revoked_session_key(unauthenticated_client):
+    """The cookie JWT stays signature-valid until ``exp``, but logout /
+    password-change revocation deletes the DB-backed session key sealed
+    inside it. A cookie whose embedded key no longer resolves must not
+    authorize BYOK writes."""
+    import jwt as _jwt
+
+    with (
+        patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_key_object",
+            new=AsyncMock(side_effect=Exception("key not found")),
+        ),
+    ):
+        cookie_jwt = _jwt.encode(
+            {
+                "user_id": "browser-user-42",
+                "key": "sk-revoked-session-key",
+                "login_method": "sso",
+                "exp": int(time.time()) + 3600,
+            },
+            "test-master-key",
+            algorithm="HS256",
+        )
+        resp = _authorize_post_with_cookie(unauthenticated_client, cookie_jwt)
+    assert resp.status_code == 401
+
+
+def test_authorize_post_accepts_cookie_with_live_session_key(unauthenticated_client):
+    """A cookie whose embedded session key still resolves keeps working."""
+    import jwt as _jwt
+
+    with (
+        patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_key_object",
+            new=AsyncMock(return_value=UserAPIKeyAuth(user_id="browser-user-42")),
+        ),
+    ):
+        cookie_jwt = _jwt.encode(
+            {
+                "user_id": "browser-user-42",
+                "key": "sk-live-session-key",
+                "login_method": "sso",
+                "exp": int(time.time()) + 3600,
+            },
+            "test-master-key",
+            algorithm="HS256",
+        )
+        resp = _authorize_post_with_cookie(unauthenticated_client, cookie_jwt)
+    assert resp.status_code == 302
 
 
 def test_authorize_post_rejects_cookie_signed_with_wrong_key(unauthenticated_client):

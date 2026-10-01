@@ -59,6 +59,7 @@ async def test_invoke_agent_a2a_adds_litellm_data():
 
     # Mock agent
     mock_agent = MagicMock()
+    mock_agent.agent_id = "test-agent"
     mock_agent.agent_card_params = {
         "url": "http://backend-agent:10001",
         "name": "Test Agent",
@@ -72,6 +73,7 @@ async def test_invoke_agent_a2a_adds_litellm_data():
             "jsonrpc": "2.0",
             "id": "test-id",
             "method": "message/send",
+            "metadata": {"model_info": {"id": "caller-supplied-id"}},
             "params": {
                 "message": {
                     "role": "user",
@@ -153,7 +155,7 @@ async def test_invoke_agent_a2a_adds_litellm_data():
             "litellm.a2a_protocol.asend_message",
             new_callable=AsyncMock,
             return_value=mock_response,
-        ),
+        ) as mock_send_message,
         patch(
             "litellm.proxy.proxy_server.general_settings",
             {},
@@ -190,6 +192,9 @@ async def test_invoke_agent_a2a_adds_litellm_data():
         mock_add_data.assert_called_once()
 
         # Verify model and custom_llm_provider were set
+        assert mock_send_message.await_args.kwargs["model"] == "a2a_agent/Test Agent"
+        assert captured_data["metadata"]["model_group"] == "a2a_agent/Test Agent"
+        assert captured_data["metadata"]["model_info"] == {"id": mock_agent.agent_id}
         assert captured_data.get("model") == "a2a_agent/Test Agent"
         assert captured_data.get("custom_llm_provider") == "a2a_agent"
 
@@ -588,7 +593,9 @@ async def test_message_send_reports_an_unresolvable_entra_credential_as_internal
     user_api_key_dict = UserAPIKeyAuth(api_key="sk-test", user_id="u1", team_id="t1")
 
     mock_proxy_logging = MagicMock()
-    mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda user_api_key_dict, data, call_type: data)
+    mock_proxy_logging.pre_call_hook = AsyncMock(
+        side_effect=lambda user_api_key_dict, data, call_type, skip_guardrails=False: data
+    )
     mock_proxy_logging.post_call_failure_hook = AsyncMock(return_value=None)
     downstream = AsyncMock()
 
@@ -956,7 +963,9 @@ async def test_subscribe_to_task_calls_pre_call_hook():
             yield chunk
 
     mock_proxy_logging = MagicMock()
-    mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda user_api_key_dict, data, call_type: data)
+    mock_proxy_logging.pre_call_hook = AsyncMock(
+        side_effect=lambda user_api_key_dict, data, call_type, skip_guardrails=False: data
+    )
     mock_proxy_logging.async_post_call_streaming_iterator_hook = _passthrough_iterator
     mock_proxy_logging.post_call_failure_hook = AsyncMock(return_value=None)
 
@@ -1089,7 +1098,9 @@ async def test_task_method_failure_hook_uses_enriched_request_data():
     mock_handler.post = AsyncMock(side_effect=RuntimeError("upstream failed"))
 
     mock_proxy_logging = MagicMock()
-    mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda user_api_key_dict, data, call_type: data)
+    mock_proxy_logging.pre_call_hook = AsyncMock(
+        side_effect=lambda user_api_key_dict, data, call_type, skip_guardrails=False: data
+    )
     mock_proxy_logging.post_call_failure_hook = AsyncMock(return_value=None)
 
     with ExitStack() as stack:
@@ -1154,7 +1165,9 @@ async def test_agentcore_invalid_context_id_returns_jsonrpc_invalid_params_400()
     user_api_key_dict = UserAPIKeyAuth(api_key="sk-test", user_id="u1", team_id="t1")
 
     mock_proxy_logging = MagicMock()
-    mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda user_api_key_dict, data, call_type: data)
+    mock_proxy_logging.pre_call_hook = AsyncMock(
+        side_effect=lambda user_api_key_dict, data, call_type, skip_guardrails=False: data
+    )
     mock_proxy_logging.post_call_failure_hook = AsyncMock(return_value=None)
 
     with ExitStack() as stack:

@@ -653,6 +653,10 @@ def test_virtual_key_llm_api_routes_denies_spend_logs_v2():
         "/mcp-rest/tools/call",
         "/mcp/tools/list",
         "/token",
+        "/mcp/sse",
+        "/mcp/sse/",
+        "/mcp/sse/messages",
+        "/mcp/sse/messages/",
     ],
 )
 def test_mcp_inference_routes_classified_as_llm_api(route):
@@ -3039,7 +3043,7 @@ def test_team_update_gate_admits_internal_user_without_org_context():  # test-qu
 
 def test_team_update_gate_defers_cross_org_admin_to_the_handler():  # test-quality-ok: the gate's only success signal is not raising; the handler's 403 it defers to is pinned in test_team_endpoints
     """An org admin of a DIFFERENT org clears the coarse gate like any internal user;
-    update_team's _resolve_team_access finds no role on the team and 403s (pinned in
+    update_team's TeamAccess.strongest_role finds no role on the team and 403s (pinned in
     test_team_endpoints), so there is still no cross-org escalation."""
     user_obj = _make_org_admin_user("org-1")
     valid_token = UserAPIKeyAuth(user_id="org-admin-user", user_role=LitellmUserRoles.INTERNAL_USER.value)
@@ -3722,6 +3726,7 @@ AGENT_MANAGEMENT_ROUTES = [
     "/v1/agents/abc-123",
     "/v1/agents/make_public",
     "/v1/agents/abc-123/make_public",
+    "/v1/agents/abc-123/kill_switch",
 ]
 
 AGENT_INFERENCE_ROUTES = [
@@ -4014,8 +4019,8 @@ def test_team_callback_routes_reach_their_handler_for_non_admins(route, role):
     """A team admin manages their own team's logging callbacks, so the route gate
     must let a non-proxy-admin through to the handler.
 
-    The handler is what authorizes: every team callback endpoint calls
-    _verify_team_access, which admits only a proxy admin, an org admin for the
+    The handler is what authorizes: every team callback endpoint asks
+    TeamAccess.allows, which admits only a proxy admin, an org admin for the
     team, or an admin of that team, and 403s everyone else. Before this, the gate
     rejected the team admin with a 401 naming proxy admin, so the handler's own
     check was unreachable for them.
@@ -4310,3 +4315,26 @@ def test_project_delete_route_stays_proxy_admin_only():
             valid_token=valid_token,
             request_data={},
         )
+
+
+@pytest.mark.parametrize("route", ("/mcp/sse", "/mcp/sse/", "/mcp/sse/messages", "/mcp/sse/messages/"))
+@pytest.mark.parametrize("route_group", ("mcp_routes", "llm_api_routes", "openai_routes"))
+def test_legacy_sse_respects_virtual_key_route_permissions(route: str, route_group: str) -> None:
+    token: Final = UserAPIKeyAuth(
+        user_id="sse-caller", user_role=LitellmUserRoles.INTERNAL_USER, allowed_routes=[route_group]
+    )
+    request: Final = Request({"type": "http", "method": "POST" if "messages" in route else "GET", "path": route})
+    if route_group == "openai_routes":
+        with pytest.raises(HTTPException) as caught:
+            RouteChecks.is_virtual_key_allowed_to_call_route(route=route, valid_token=token, request=request)
+        assert caught.value.status_code == 403
+        return
+    RouteChecks.non_proxy_admin_allowed_routes_check(
+        user_obj=None,
+        _user_role=LitellmUserRoles.INTERNAL_USER,
+        route=route,
+        request=request,
+        valid_token=token,
+        request_data={},
+    )
+    assert RouteChecks.is_virtual_key_allowed_to_call_route(route=route, valid_token=token, request=request)
