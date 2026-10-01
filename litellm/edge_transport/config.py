@@ -77,6 +77,12 @@ class EdgeTransportConfig:
     # Route: requests whose model equals this (or starts with "<this>/")
     # take the Differential Context edge path.
     route_model: str = DEFAULT_ROUTE_MODEL
+    # The model name the WAN chain/engine knows (e.g. the engine's served
+    # model path). When set, the OUTBOUND payload model is rewritten to this
+    # value on BOTH paths (edge envelope and ordinary fallback) while the
+    # client-facing model name stays the route model. Empty = send the
+    # client model name unchanged.
+    upstream_model: str = ""
     timeout_seconds: float = 600.0
     connect_timeout_seconds: float = 10.0
     # Capabilities cache TTL (step 5 contract validation). Phase 3.5 §18:
@@ -123,6 +129,7 @@ def load_config() -> EdgeTransportConfig:
             ("x-kilo-session-id", "x-cline-session-id", "x-kelvin-session-id", "x-session-id"),
         ),
         route_model=os.environ.get("EDGE_SSEPROXY_ROUTE_MODEL", DEFAULT_ROUTE_MODEL),
+        upstream_model=os.environ.get("EDGE_SSEPROXY_UPSTREAM_MODEL", "").strip(),
         timeout_seconds=float(os.environ.get("EDGE_SSEPROXY_TIMEOUT_SECONDS", "600")),
         connect_timeout_seconds=float(os.environ.get("EDGE_SSEPROXY_CONNECT_TIMEOUT_SECONDS", "10")),
         capabilities_refresh_seconds=float(

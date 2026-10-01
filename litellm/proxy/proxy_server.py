@@ -9934,6 +9934,25 @@ async def chat_completion(
         if hasattr(user_api_key_dict, "agent_id") and user_api_key_dict.agent_id is not None:
             data["metadata"]["agent_id"] = user_api_key_dict.agent_id
 
+    # Differential Context edge route (Phase 3 §46): the proxy dispatches via
+    # llm_router.schedule_acompletion and never reaches litellm.acompletion,
+    # so the edge hook must intercept here, BEFORE the router (model-name and
+    # provider-param validation included). Requests whose model matches the
+    # edge route model are handled entirely by the edge transport; nothing
+    # here calls the router or any provider, and no hidden retry/downgrade
+    # exists on the edge path.
+    _edge_model = model or str(data.get("model", ""))
+    if _edge_model:
+        from litellm.edge_transport.router import route_edge_proxy
+
+        _edge_result = await route_edge_proxy(
+            model=_edge_model,
+            data=data,
+            headers=dict(request.headers),
+        )
+        if _edge_result is not None:
+            return _edge_result
+
     base_llm_response_processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         result: Final = await base_llm_response_processor.base_process_llm_request(

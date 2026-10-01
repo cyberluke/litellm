@@ -1,0 +1,26 @@
+# =============================================================================
+# edge-proxy.example.yaml — LiteLLM-native proxy config (SAFE EXAMPLE)
+# =============================================================================
+# Passed to the proxy CLI with `--config` by scripts/Start-LiteLLM-Edge.ps1.
+# The ONLY reason this file exists is that the LiteLLM proxy validates the
+# requested model name against its model_list BEFORE the Differential
+# Context edge hook (litellm.acompletion -> maybe_route_edge) can intercept
+# it. Declaring the edge route model here makes the proxy accept it; the
+# deployment entry is never actually called — the edge transport takes over
+# in acompletion before any provider dispatch, and no remote /tokenize or
+# hidden retry ever happens.
+#
+# Copy to edge-proxy.local.yaml (gitignored) for the real runtime profile.
+
+model_list:
+  - model_name: differential_sseproxy
+    litellm_params:
+      # Provider prefix + dummy base so the router accepts the entry at
+      # startup. NEVER reached: the edge hook intercepts the request first.
+      # Do not point this at a real provider or real credentials.
+      model: openai/differential_sseproxy
+      api_base: http://127.0.0.1:1/v1
+
+# No master_key by default: the edge binds loopback only. To require auth,
+# add `general_settings: { master_key: "${LITELLM_MASTER_KEY}" }` in the
+# LOCAL file (never here) and configure agents with that key.

@@ -18,6 +18,10 @@ env:
   # --- master switch ------------------------------------------------------
   EDGE_SSEPROXY_ENABLED: "1"
   EDGE_SSEPROXY_ROUTE_MODEL: "differential_sseproxy"
+  # Model name the WAN chain/engine knows; the outbound payload model is
+  # rewritten to this value while the client-facing model stays the route
+  # model. Empty = send the client model name unchanged.
+  EDGE_SSEPROXY_UPSTREAM_MODEL: ""
 
   # --- WAN boundary -------------------------------------------------------
   # Caddy TLS + ALPN h2 frontend of SSEProxy. NEVER the aiohttp backend port.
@@ -56,6 +60,10 @@ proxy:
   host: "127.0.0.1"
   port: 4000
   num_workers: 1
+  # LiteLLM-native proxy config passed with --config. Declares the edge
+  # route model (differential_sseproxy) so the proxy's model validation
+  # lets the request through to the edge hook. See edge-proxy.example.yaml.
+  config_file: "config/edge-proxy.local.yaml"
 
 runtime:
   # Dedicated Python environment (relative to repo root or absolute).

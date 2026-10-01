@@ -102,8 +102,10 @@ async def maybe_route_edge(
         return None
     if not route_matches(model):
         return None
-    if kwargs.get("custom_llm_provider"):
-        return None
+    # NOTE: there is deliberately NO custom_llm_provider bail-out here. The
+    # edge route model name is reserved for the edge transport; an explicit
+    # provider qualifier on that exact name must not fall through to normal
+    # dispatch (which would hit an unrelated provider with edge semantics).
 
     from litellm.types.utils import ModelResponse
 
@@ -143,4 +145,98 @@ async def _chunk_wrapper(
         yield ModelResponse.model_validate(chunk)
 
 
-__all__ = ["maybe_route_edge", "route_matches", "_transport"]
+async def route_edge_proxy(
+    *, model: str, data: dict[str, Any], headers: Optional[dict[str, str]] = None
+) -> Optional[Any]:
+    """Proxy-layer edge route handler.
+
+    The LiteLLM proxy (proxy_server.chat_completion) dispatches through its
+    own ``llm_router.schedule_acompletion`` and NEVER reaches
+    ``litellm.acompletion``, so the acompletion-level edge hook cannot fire
+    on the HTTP path. proxy_server intercepts the edge route BEFORE the
+    router and calls this: edge semantics for non-stream requests return a
+    ``ModelResponse`` (jsonified by the handler); stream requests return an
+    SSE response whose frames are ordinary OpenAI chunk dicts followed by
+    ``[DONE]`` (the Differential Context ACK was already stripped by the
+    transport). Nothing here ever calls the router or a provider.
+    """
+    config = get_config()
+    if not config.enabled:
+        return None
+    if not route_matches(model):
+        return None
+
+    messages = data.get("messages")
+    if not messages:
+        raise ValueError("edge route: request has no messages")
+
+    stream = data.get("stream") is True
+    generation_params = {
+        key: value
+        for key, value in data.items()
+        if key in _GENERATION_PARAM_KEYS and value is not None
+    }
+
+    transport = _transport()
+    response, meta = await transport.acompletion(
+        model=model,
+        messages=list(messages),
+        stream=stream,
+        headers=headers or {},
+        generation_params=generation_params,
+    )
+
+    if not stream:
+        from litellm.types.utils import ModelResponse
+
+        if isinstance(response, dict):
+            return ModelResponse.model_validate(response)
+        return response
+
+    import json as _json
+    import time as _time
+    from uuid import uuid4 as _uuid4
+
+    from sse_starlette.sse import EventSourceResponse
+
+    async def _frames() -> AsyncIterator[dict[str, str]]:
+        # The WAN stream yields ENGINE-NATIVE frames
+        # ({"text", "output_ids", "meta_info", ...}) — convert each into an
+        # ordinary OpenAI chat.completion.chunk so standard OpenAI clients
+        # (Kilo, etc.) parse it. The Differential Context ACK was already
+        # stripped by the transport.
+        async for chunk in response:
+            if not isinstance(chunk, dict):
+                continue
+            text = chunk.get("text")
+            meta = chunk.get("meta_info")
+            meta = meta if isinstance(meta, dict) else {}
+            finish = None
+            fr = meta.get("finish_reason")
+            if isinstance(fr, dict):
+                finish = fr.get("type") or None
+            elif isinstance(fr, str):
+                finish = fr or None
+            oai_chunk = {
+                "id": meta.get("id") or f"dc_{_uuid4().hex[:12]}",
+                "object": "chat.completion.chunk",
+                "created": int(_time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": text} if isinstance(text, str) else {},
+                        "finish_reason": finish,
+                    }
+                ],
+            }
+            yield {"data": _json.dumps(oai_chunk, default=str)}
+        yield {"data": "[DONE]"}
+
+    return EventSourceResponse(
+        _frames(),
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+__all__ = ["maybe_route_edge", "route_edge_proxy", "route_matches", "_transport"]

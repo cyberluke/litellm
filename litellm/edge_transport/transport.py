@@ -209,6 +209,13 @@ class EdgeTransport:
         if generation_params:
             payload.update(generation_params)
         payload["stream"] = stream
+        # The WAN chain/engine validates the model name against ITS model
+        # (e.g. the engine's served model path). When upstream_model is
+        # configured, rewrite the OUTBOUND model on both paths (edge
+        # envelope and ordinary fallback); the client-facing route model
+        # name is unaffected.
+        if self.config.upstream_model:
+            payload["model"] = self.config.upstream_model
 
         resolution = resolve_session(headers, payload, self.config)
         if resolution.context_id is None:

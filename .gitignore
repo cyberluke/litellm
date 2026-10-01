@@ -147,4 +147,6 @@ litellm.log
 # ---- Local Differential Context edge runtime (never commit) ----
 config/edge-production.local.yaml
 config/edge-production.local.yml
+config/edge-proxy.local.yaml
+config/edge-proxy.local.yml
 *.pid
