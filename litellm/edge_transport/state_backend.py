@@ -88,6 +88,21 @@ _PENDING_COLUMNS = (
     "pending_created_at",
 )
 
+# Phase 3.5 schema v2 columns (§8, previous unconfirmed send retention).
+# Pre-v2 databases (schema v1, created before this feature) lack these;
+# CREATE TABLE IF NOT EXISTS never alters an existing table, so the backend
+# migrates missing columns on open (see SqliteStateBackend.__init__).
+_LAST_PENDING_COLUMN_DECLS = {
+    "last_pending_request_id": "TEXT",
+    "last_pending_base_generation": "INTEGER",
+    "last_pending_base_state_hash": "TEXT",
+    "last_pending_next_generation": "INTEGER",
+    "last_pending_predicted_state_hash": "TEXT",
+    "last_pending_canonical_prompt_state": "TEXT",
+    "last_pending_operation_type": "TEXT",
+    "last_pending_created_at": "REAL",
+}
+
 _LAST_PENDING_COLUMNS = (
     "last_pending_request_id",
     "last_pending_base_generation",
@@ -291,6 +306,18 @@ class SqliteEdgeStateBackend(EdgeStateBackend):
         self._conn.execute("PRAGMA synchronous=NORMAL")
         with self._conn:
             self._conn.execute(_DDL)
+            # Migration: schema v1 -> v2. ALTER TABLE ADD COLUMN for every
+            # last_pending_* column missing from an existing edge_state
+            # table (idempotent; fresh databases already carry them).
+            existing = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(edge_state)").fetchall()
+            }
+            for column, decl in _LAST_PENDING_COLUMN_DECLS.items():
+                if column not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE edge_state ADD COLUMN {column} {decl}"
+                    )
             self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
 
     def load_all(self) -> list[PersistedEdgeContext]:
