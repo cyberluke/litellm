@@ -66,6 +66,17 @@ if ($NumWorkers -ne 1) {
     throw "Edge profile requires a single worker (proxy.num_workers must be 1); the worker_guard fails startup otherwise."
 }
 
+# LiteLLM-native proxy config (declares the edge route model so the proxy's
+# model validation lets differential_sseproxy through to the edge hook).
+$ProxyConfigRel = [string]$cfg['proxy']['config_file']
+if ([string]::IsNullOrWhiteSpace($ProxyConfigRel)) {
+    $ProxyConfigRel = 'config/edge-proxy.local.yaml'
+}
+$ProxyConfig = if ([System.IO.Path]::IsPathRooted($ProxyConfigRel)) { $ProxyConfigRel } else { Join-Path $RepoRoot $ProxyConfigRel }
+if (-not (Test-Path -LiteralPath $ProxyConfig)) {
+    throw "Proxy config not found: $ProxyConfig`nCopy config\edge-proxy.example.yaml to edge-proxy.local.yaml first."
+}
+
 $pythonRel = [string]$cfg['runtime']['python_env']
 $Python = if ([System.IO.Path]::IsPathRooted($pythonRel)) { $pythonRel } else { Join-Path $RepoRoot $pythonRel }
 if (-not (Test-Path -LiteralPath $Python)) {
@@ -117,12 +128,13 @@ Write-Host ("bind          : ${BindHost}:${Port} (loopback only)")
 Write-Host ("workers       : " + $NumWorkers)
 Write-Host ("edge sqlite   : " + $DbPath)
 Write-Host ("logs          : " + $LogOut + " / " + $LogErr)
+Write-Host ("proxy config  : " + $ProxyConfig)
 Write-Host ("WAN base URL  : " + $BaseUrl)
 
 if ($DryRun) {
     Write-Host ''
     Write-Host 'DRY RUN - no process launched. Launch would use:'
-    Write-Host ("  & '" + $Python + "' -m litellm.proxy.proxy_cli --host " + $BindHost + " --port " + $Port + " --num_workers " + $NumWorkers)
+    Write-Host ("  & '" + $Python + "' -m litellm.proxy.proxy_cli --config " + $ProxyConfig + " --host " + $BindHost + " --port " + $Port + " --num_workers " + $NumWorkers)
     Write-Host 'Nothing was started. SGLang and remote routing are untouched.'
     exit 0
 }
@@ -142,7 +154,7 @@ $psi.WorkingDirectory = $RepoRoot
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
-foreach ($arg in @('-m', 'litellm.proxy.proxy_cli', '--host', $BindHost, '--port', [string]$Port, '--num_workers', [string]$NumWorkers)) {
+foreach ($arg in @('-m', 'litellm.proxy.proxy_cli', '--config', $ProxyConfig, '--host', $BindHost, '--port', [string]$Port, '--num_workers', [string]$NumWorkers)) {
     [void]$psi.ArgumentList.Add($arg)
 }
 
