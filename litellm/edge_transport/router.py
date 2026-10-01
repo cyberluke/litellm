@@ -228,6 +228,27 @@ async def route_edge_proxy(
         async for chunk in response:
             if not isinstance(chunk, dict):
                 continue
+            err = chunk.get("error")
+            if err is not None:
+                # Upstream/engine rejection frame (e.g. "Model only supports
+                # text input"): surface it as an OpenAI stream error instead
+                # of an empty chunk + [DONE], which clients render as
+                # "Response ended unexpectedly and may be incomplete".
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                code = err.get("code") if isinstance(err, dict) else None
+                yield {
+                    "data": _json.dumps(
+                        {
+                            "error": {
+                                "message": msg,
+                                "type": "upstream_error",
+                                "code": code or 502,
+                            }
+                        },
+                        default=str,
+                    )
+                }
+                return
             text = chunk.get("text")
             meta = chunk.get("meta_info")
             meta = meta if isinstance(meta, dict) else {}
