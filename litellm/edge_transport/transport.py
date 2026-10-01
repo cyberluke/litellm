@@ -107,6 +107,29 @@ class UnrecoverableEdgeConflict(EdgeTransportError):
     the caller must decide on an explicit RESYNC_FULL."""
 
 
+def _error_detail(response: httpx.Response) -> str:
+    """Bounded upstream error excerpt for EdgeTransportError messages, so
+    clients see WHY the WAN chain rejected the request (e.g. the engine
+    refusing multimodal input) instead of a bare status code."""
+    try:
+        text = response.text.strip()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    try:
+        doc = response.json()
+        if isinstance(doc, dict) and "error" in doc:
+            msg = doc["error"]
+            if isinstance(msg, dict):
+                msg = msg.get("message") or ""
+            if isinstance(msg, str) and msg:
+                return f": {msg[:300]}"
+    except Exception:
+        pass
+    return f": {text[:300]}"
+
+
 @dataclass(slots=True)
 class EdgeMeta:
     """Observability metadata returned beside the OpenAI response."""
@@ -209,6 +232,12 @@ class EdgeTransport:
         if generation_params:
             payload.update(generation_params)
         payload["stream"] = stream
+        # Header keys are matched case-insensitively by the session resolver
+        # (coding-agent adapters send e.g. X-Kilo-Session-ID); normalize so
+        # direct SDK callers with mixed-case extra_headers work identically
+        # to the proxy path (whose Starlette headers are already lowercase).
+        if headers:
+            headers = {str(k).lower(): str(v) for k, v in headers.items()}
         # The WAN chain/engine validates the model name against ITS model
         # (e.g. the engine's served model path). When upstream_model is
         # configured, rewrite the OUTBOUND model on both paths (edge
@@ -617,7 +646,7 @@ class EdgeTransport:
 
         if response.status_code >= 400:
             raise EdgeTransportError(
-                f"edge endpoint returned {response.status_code}",
+                f"edge endpoint returned {response.status_code}{_error_detail(response)}",
                 status=response.status_code,
             )
         return response, negotiated
@@ -663,7 +692,7 @@ class EdgeTransport:
         m.M_NEGOTIATED.labels(negotiated or "unknown").inc()
         if response.status_code >= 400:
             raise EdgeTransportError(
-                f"ordinary endpoint returned {response.status_code}",
+                f"ordinary endpoint returned {response.status_code}{_error_detail(response)}",
                 status=response.status_code,
             )
         if payload.get("stream"):

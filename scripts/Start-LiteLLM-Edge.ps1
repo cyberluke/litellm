@@ -148,6 +148,20 @@ Export-EdgeEnvBlock -EnvBlock $resolvedEnv
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
+# Windows mtime granularity can leave STALE .pyc files next to freshly
+# edited modules (Python trusts a pyc whose recorded mtime matches the .py
+# within the same tick) — the edge transport has been bitten by this twice.
+# Best-effort cleanup of the local fork's bytecode caches before launch.
+foreach ($pycDir in @(
+        (Join-Path $RepoRoot 'litellm\__pycache__'),
+        (Join-Path $RepoRoot 'litellm\edge_transport\__pycache__'),
+        (Join-Path $RepoRoot 'litellm\proxy\__pycache__')
+    )) {
+    if (Test-Path -LiteralPath $pycDir) {
+        Remove-Item -LiteralPath $pycDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = $Python
 $psi.WorkingDirectory = $RepoRoot

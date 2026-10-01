@@ -33,6 +33,7 @@ import logging
 from typing import Any, AsyncIterator, Optional
 
 from .config import get_config
+from .transport import EdgeTransportError
 
 logger = logging.getLogger("litellm.edge_transport")
 
@@ -75,7 +76,7 @@ def _transport() -> Any:
     """Lazy singleton (created on first use inside the running loop)."""
     global _EDGE_TRANSPORT
     if _EDGE_TRANSPORT is None:
-        from .transport import EdgeTransport
+        from .transport import EdgeTransport, EdgeTransportError
 
         _EDGE_TRANSPORT = EdgeTransport(get_config())
     return _EDGE_TRANSPORT
@@ -178,13 +179,32 @@ async def route_edge_proxy(
     }
 
     transport = _transport()
-    response, meta = await transport.acompletion(
-        model=model,
-        messages=list(messages),
-        stream=stream,
-        headers=headers or {},
-        generation_params=generation_params,
-    )
+    try:
+        response, meta = await transport.acompletion(
+            model=model,
+            messages=list(messages),
+            stream=stream,
+            headers=headers or {},
+            generation_params=generation_params,
+        )
+    except EdgeTransportError as exc:
+        # Surface the WAN chain's rejection to the client as a CLEAN error
+        # (e.g. "edge endpoint returned 502: image input not supported")
+        # instead of a generic 500 or a silently broken stream. Kilo Code
+        # renders this JSON error directly.
+        from fastapi.responses import JSONResponse
+
+        status = exc.status or 502
+        return JSONResponse(
+            status_code=status,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "edge_transport_error",
+                    "code": status,
+                }
+            },
+        )
 
     if not stream:
         from litellm.types.utils import ModelResponse
