@@ -130,6 +130,12 @@ if ($DryRun) {
 # --- export edge env + launch -------------------------------------------------
 Export-EdgeEnvBlock -EnvBlock $resolvedEnv
 
+# UTF-8 stdio for the child: LiteLLM's startup banner contains non-cp1252
+# characters and crashes the proxy on a cp1252 console (UnicodeEncodeError,
+# exit code 3) without this.
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = $Python
 $psi.WorkingDirectory = $RepoRoot
@@ -143,18 +149,32 @@ foreach ($arg in @('-m', 'litellm.proxy.proxy_cli', '--host', $BindHost, '--port
 $proc = [System.Diagnostics.Process]::new()
 $proc.StartInfo = $psi
 
-# append-only log pump (never truncate previous diagnostics)
+# append-only log pump (never truncate previous diagnostics). Writes every
+# line IMMEDIATELY (AutoFlush) so logs survive regardless of how/when the
+# launcher or the child exits. PS 7.6-rc/.NET 10 exposes Process output
+# events only through Register-ObjectEvent (the property adapter `+=` form
+# fails with "property not found"), so the writer is carried via MessageData.
 $outWriter = [System.IO.StreamWriter]::new($LogOut, $true)
 $errWriter = [System.IO.StreamWriter]::new($LogErr, $true)
+$outWriter.AutoFlush = $true
+$errWriter.AutoFlush = $true
+
+$outAction = {
+    $writer = $Event.MessageData
+    $data = $Event.SourceEventArgs.Data
+    if ($null -ne $data) { try { $writer.WriteLine($data) } catch { } }
+}
+$errAction = {
+    $writer = $Event.MessageData
+    $data = $Event.SourceEventArgs.Data
+    if ($null -ne $data) { try { $writer.WriteLine($data) } catch { } }
+}
+$null = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $outWriter -Action $outAction
+$null = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $errWriter -Action $errAction
+
 $proc.Start() | Out-Null
-$outPump = $proc.StandardOutput.ReadToEndAsync().ContinueWith([System.Action[System.Threading.Tasks.Task[System.String]]]{
-    param($t)
-    try { $outWriter.Write($t.Result) } finally { $outWriter.Dispose() }
-})
-$errPump = $proc.StandardError.ReadToEndAsync().ContinueWith([System.Action[System.Threading.Tasks.Task[System.String]]]{
-    param($t)
-    try { $errWriter.Write($t.Result) } finally { $errWriter.Dispose() }
-})
+$proc.BeginOutputReadLine()
+$proc.BeginErrorReadLine()
 
 $started = Get-Date
 $pidContent = @(
@@ -211,7 +231,7 @@ if (-not $liveOk) {
 if ($ProbeRemote -and $BaseUrl -notlike '*CHANGE_ME*' -and $BaseUrl -notlike '${*') {
     try {
         $headers = @{ Authorization = 'Bearer ' + [string]$resolvedEnv['EDGE_SSEPROXY_API_KEY'] }
-        $cap = Invoke-WebRequest -Uri "$BaseUrl/v1/transport/capabilities" -Headers $headers -UseBasicParsing -TimeoutSec 10
+        $cap = Invoke-EdgeWebRequest -Uri "$BaseUrl/v1/transport/capabilities" -Headers $headers -TimeoutSec 10
         Write-Host ("remote capabilities: " + $BaseUrl + "/v1/transport/capabilities -> " + $cap.StatusCode)
     } catch {
         Write-Warning ("remote capabilities: UNREACHABLE - " + $BaseUrl + "/v1/transport/capabilities (" + $_.Exception.Message + ")")
@@ -220,6 +240,19 @@ if ($ProbeRemote -and $BaseUrl -notlike '*CHANGE_ME*' -and $BaseUrl -notlike '${
     Write-Host 'remote capabilities: skipped (placeholder base URL or probe disabled)'
 }
 
+# --- supervisor: stay attached to the edge process ------------------------------
 Write-Host ''
-Write-Host 'Edge started locally. SGLang and remote routing were NOT touched.'
+Write-Host ("Edge running (PID " + $proc.Id + "). Keep this window open; live logs are appended to:")
+Write-Host ("  " + $LogOut)
+Write-Host ("  " + $LogErr)
+Write-Host 'Stop it with Ctrl+C here or with scripts\Stop-LiteLLM-Edge.ps1 (another window).'
+Write-Host 'SGLang and remote routing were NOT touched.'
+try {
+    $proc.WaitForExit()
+    Write-Host ''
+    Write-Host ("Edge process exited (code " + $proc.ExitCode + "). See the logs above.")
+} finally {
+    try { $outWriter.Dispose() } catch { }
+    try { $errWriter.Dispose() } catch { }
+}
 exit 0

@@ -28,7 +28,7 @@ $cfg = Read-EdgeConfigFile -Path $ConfigPath
 
 $BindHost = [string]$cfg['proxy']['host']
 $Port = [int]$cfg['proxy']['port']
-$LocalBaseUrl = "http://${Host}:${Port}"
+$LocalBaseUrl = "http://${BindHost}:${Port}"
 
 $PidFile = [string]$cfg['runtime']['pid_file']
 $PidFile = [System.Environment]::ExpandEnvironmentVariables($PidFile)
@@ -96,9 +96,9 @@ Write-Host ("readiness  : " + $(if ($ready) { $ready } else { 'no response' }))
 # --- remote capabilities (best effort) ------------------------------------------
 if ($BaseUrl -and $BaseUrl -notlike '*CHANGE_ME*' -and $BaseUrl -notlike '${*') {
     try {
-        $cap = Invoke-WebRequest -Uri "$BaseUrl/v1/transport/capabilities" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        $cap = Invoke-EdgeWebRequest -Uri "$BaseUrl/v1/transport/capabilities" -TimeoutSec 10
         $capJson = $cap.Content | ConvertFrom-Json
-        Write-Host ("remote caps: " + $BaseUrl + " -> " + $cap.StatusCode + " (edge " + $capJson.edge_protocol_version + ", wan " + ($capJson.wan_http_versions -join ',') + ")")
+        Write-Host ("remote caps: " + $BaseUrl + " -> " + $cap.StatusCode + " (transport " + $capJson.transport_version + ", wan " + ($capJson.http.wan_versions -join ',') + ")")
     } catch {
         Write-Host ("remote caps: UNREACHABLE (" + $_.Exception.Message + ")")
     }

@@ -91,5 +91,27 @@ function Export-EdgeEnvBlock {
     }
 }
 
+function Invoke-EdgeWebRequest {
+    # WAN probe helper: the bench Caddy frontend serves a self-signed cert
+    # (the edge transport itself runs with EDGE_SSEPROXY_VERIFY_TLS=false),
+    # so read-only probes must tolerate it. PS7 has -SkipCertificateCheck;
+    # Windows PowerShell 5.1 falls back to the ServicePointManager callback.
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [System.Collections.IDictionary]$Headers = @{},
+        [int]$TimeoutSec = 10
+    )
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        return Invoke-WebRequest -Uri $Uri -Headers $Headers -UseBasicParsing -SkipCertificateCheck -TimeoutSec $TimeoutSec -ErrorAction Stop
+    }
+    $prev = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        return Invoke-WebRequest -Uri $Uri -Headers $Headers -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+    } finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prev
+    }
+}
+
 # NOTE: this file is dot-sourced (not imported as a module), so all
 # functions above are available in the caller's scope automatically.

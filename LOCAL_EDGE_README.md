@@ -28,11 +28,18 @@ The launcher:
   puts the current directory first on `sys.path`).
 - binds `127.0.0.1:4000` with a single worker (the edge profile is
   process-local and MUST NOT run multi-worker);
-- appends logs to `D:\_SATIN_AI_2\logs\litellm-edge\` (never truncates);
+- forces UTF-8 stdio for the child (`PYTHONUTF8=1`) — required, otherwise
+  the LiteLLM startup banner crashes the proxy with `UnicodeEncodeError`
+  (exit code 3) on a cp1252 Windows console;
+- appends logs to `D:\_SATIN_AI_2\logs\litellm-edge\` (every line written
+  immediately, never truncates);
 - writes a PID file and refuses to start a duplicate instance;
 - waits for `/health/liveliness` then `/health/readiness`;
-- optionally probes the remote WAN `/v1/transport/capabilities` and reports
-  unavailability clearly.
+- optionally probes the remote WAN `/v1/transport/capabilities` (tolerates
+  the self-signed bench certificate) and reports unavailability clearly;
+- then STAYS ATTACHED as the supervisor: keep the window open, live logs
+  stream to the console and the log files; stop with Ctrl+C in that window
+  or with `Stop-LiteLLM-Edge.ps1` from another window.
 
 Use `.\scripts\Start-LiteLLM-Edge.ps1 -DryRun` to validate everything without
 launching anything.
