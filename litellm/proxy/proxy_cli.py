@@ -993,6 +993,17 @@ def run_server(
         return
 
     args: Final = locals()
+
+    # Phase 3.5 §2/§21: the Differential Context edge profile owns
+    # process-local state + per-context locks. Fail startup with a clear
+    # configuration error when the edge profile is enabled with more than
+    # one worker and no explicit cross-process shared backend. Runs BEFORE
+    # the proxy-server imports so the guard is reachable even when the
+    # optional proxy deps are missing.
+    from litellm.edge_transport.worker_guard import assert_edge_worker_safety
+
+    assert_edge_worker_safety(num_workers=num_workers)
+
     if local:
         from proxy_server import (
             KeyManagementSettings,

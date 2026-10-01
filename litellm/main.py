@@ -490,6 +490,26 @@ async def acompletion(
     loop: Final = asyncio.get_event_loop()
     custom_llm_provider = kwargs.get("custom_llm_provider", None)
 
+    # ------------------------------------------------------------------
+    # Differential Context edge route (Phase 3 §46 steps 12/13).
+    # A configured model name routes to the local edge transport
+    # (HTTP/2 + compression + differential delta to the SSEProxy WAN
+    # frontend). Unrelated providers never share that transport; when the
+    # route is inactive this hook returns None and normal dispatch runs.
+    # Errors on an ACTIVE route propagate (no silent fallback).
+    # ------------------------------------------------------------------
+    from litellm.edge_transport.router import maybe_route_edge
+
+    edge_result = await maybe_route_edge(
+        model=model,
+        messages=messages,
+        stream=stream,
+        kwargs=kwargs,
+        extra_headers=extra_headers,
+    )
+    if edge_result is not None:
+        return edge_result
+
     ## PROMPT MANAGEMENT HOOKS ##
     #########################################################
     #########################################################
