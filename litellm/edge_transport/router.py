@@ -210,6 +210,21 @@ async def route_edge_proxy(
         from litellm.types.utils import ModelResponse
 
         if isinstance(response, dict):
+            # The engine's Differential Context route returns RAW model
+            # output: DeepSeek tool calls arrive as <|DSML|...|> markup in
+            # the content. Extract them into OpenAI tool_calls and strip the
+            # markup so clients execute the calls instead of rendering the
+            # raw tokens.
+            from .deepseek_tools import parse_deepseek_tool_calls
+
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                    clean, calls = parse_deepseek_tool_calls(msg["content"])
+                    if calls:
+                        msg["content"] = clean
+                        msg["tool_calls"] = calls
             return ModelResponse.model_validate(response)
         return response
 
@@ -225,6 +240,35 @@ async def route_edge_proxy(
         # ordinary OpenAI chat.completion.chunk so standard OpenAI clients
         # (Kilo, etc.) parse it. The Differential Context ACK was already
         # stripped by the transport.
+        #
+        # DeepSeek tool calls arrive as <|DSML|...|> markup INSIDE the text
+        # (the engine's Differential Context route does not post-process the
+        # output). The full text is buffered, parsed at the end, and the
+        # markup is re-emitted as OpenAI tool_calls deltas (the engine emits
+        # the whole response in one frame, so buffering adds no latency).
+        from .deepseek_tools import parse_deepseek_tool_calls
+
+        text_parts: list[str] = []
+        meta_info: dict[str, Any] = {}
+        finish: Optional[str] = None
+
+        def _oai(delta: dict[str, Any], fin: Optional[str] = None) -> dict[str, str]:
+            nonlocal meta_info
+            oai_chunk = {
+                "id": meta_info.get("id") or f"dc_{_uuid4().hex[:12]}",
+                "object": "chat.completion.chunk",
+                "created": int(_time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": fin,
+                    }
+                ],
+            }
+            return {"data": _json.dumps(oai_chunk, default=str)}
+
         async for chunk in response:
             if not isinstance(chunk, dict):
                 continue
@@ -252,26 +296,45 @@ async def route_edge_proxy(
             text = chunk.get("text")
             meta = chunk.get("meta_info")
             meta = meta if isinstance(meta, dict) else {}
-            finish = None
+            if isinstance(text, str):
+                text_parts.append(text)
+            if meta:
+                meta_info.update({k: v for k, v in meta.items() if v is not None})
             fr = meta.get("finish_reason")
             if isinstance(fr, dict):
-                finish = fr.get("type") or None
-            elif isinstance(fr, str):
-                finish = fr or None
-            oai_chunk = {
-                "id": meta.get("id") or f"dc_{_uuid4().hex[:12]}",
-                "object": "chat.completion.chunk",
-                "created": int(_time.time()),
-                "model": model,
-                "choices": [
+                fr = fr.get("type") or None
+            elif not isinstance(fr, str):
+                fr = None
+            if isinstance(fr, str) and fr:
+                finish = fr
+
+        full_text = "".join(text_parts)
+        clean_text, tool_calls = parse_deepseek_tool_calls(full_text) if full_text else (full_text, [])
+        if tool_calls:
+            if clean_text:
+                yield _oai({"content": clean_text})
+            for i, call in enumerate(tool_calls):
+                fn = call.get("function") or {}
+                yield _oai(
                     {
-                        "index": 0,
-                        "delta": {"content": text} if isinstance(text, str) else {},
-                        "finish_reason": finish,
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": call.get("id") or f"call_{i + 1}",
+                                "type": "function",
+                                "function": {
+                                    "name": fn.get("name") or "",
+                                    "arguments": fn.get("arguments") or "",
+                                },
+                            }
+                        ]
                     }
-                ],
-            }
-            yield {"data": _json.dumps(oai_chunk, default=str)}
+                )
+            yield _oai({}, "tool_calls")
+        else:
+            if full_text:
+                yield _oai({"content": full_text})
+            yield _oai({}, finish or "stop")
         yield {"data": "[DONE]"}
 
     return EventSourceResponse(
