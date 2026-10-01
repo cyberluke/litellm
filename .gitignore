@@ -143,3 +143,8 @@ crash.*.log
 
 ui/litellm-dashboard/out/
 litellm.log
+
+# ---- Local Differential Context edge runtime (never commit) ----
+config/edge-production.local.yaml
+config/edge-production.local.yml
+*.pid

@@ -1,0 +1,67 @@
+# =============================================================================
+# Differential Context edge — production profile (SAFE EXAMPLE)
+# =============================================================================
+# Copy this file to `edge-production.local.yaml` (gitignored) and fill in the
+# REAL values. This example contains NO secrets and is safe to commit.
+#
+# Loader contract (scripts/Start-LiteLLM-Edge.ps1):
+#   - the `env:` block is parsed line-by-line as flat `NAME: value` entries;
+#   - a value of the form `${VAR}` is taken from the process environment when
+#     that variable is set, otherwise the literal string is used;
+#   - every `env:` variable is exported into the LiteLLM process environment;
+#   - the `proxy:` block drives the CLI arguments (host/port/num_workers).
+#
+# The edge profile is env-driven (EDGE_SSEPROXY_* / EDGE_STATE_*); the proxy
+# itself runs `python -m litellm.proxy.proxy_cli` with the CLI flags below.
+
+env:
+  # --- master switch ------------------------------------------------------
+  EDGE_SSEPROXY_ENABLED: "1"
+  EDGE_SSEPROXY_ROUTE_MODEL: "differential_sseproxy"
+
+  # --- WAN boundary -------------------------------------------------------
+  # Caddy TLS + ALPN h2 frontend of SSEProxy. NEVER the aiohttp backend port.
+  # Placeholder — set the real host in edge-production.local.yaml.
+  EDGE_SSEPROXY_BASE_URL: "https://CHANGE_ME_WAN_HOST:8443"
+  # Real API key: from the environment (EDGE_SSEPROXY_API_KEY) or the local
+  # ignored config. Never commit a real key.
+  EDGE_SSEPROXY_API_KEY: "${EDGE_SSEPROXY_API_KEY}"
+
+  # --- transport policy ---------------------------------------------------
+  EDGE_SSEPROXY_STRICT_HTTP2: "true"        # no silent HTTP/1.1 downgrade
+  EDGE_SSEPROXY_REQUEST_COMPRESSION: "zstd" # gzip allowed when explicitly negotiated
+  EDGE_SSEPROXY_COMPRESSION_THRESHOLD: "1024"
+  EDGE_SSEPROXY_MAX_REQUEST_BYTES: "8388608"
+  EDGE_SSEPROXY_VERIFY_TLS: "true"
+  EDGE_SSEPROXY_TIMEOUT_SECONDS: "600"
+  EDGE_SSEPROXY_CONNECT_TIMEOUT_SECONDS: "10"
+  EDGE_SSEPROXY_CAPABILITIES_REFRESH_SECONDS: "300"
+  EDGE_SSEPROXY_MAX_CONNECTIONS: "50"
+  EDGE_SSEPROXY_MAX_KEEPALIVE_CONNECTIONS: "20"
+
+  # --- session identity ---------------------------------------------------
+  EDGE_SSEPROXY_SESSION_HEADERS: "x-dc-session-id"
+  EDGE_SSEPROXY_SESSION_BODY_KEYS: "session_id,metadata.session_id"
+  EDGE_SSEPROXY_ADAPTER_SESSION_HEADERS: "x-kilo-session-id,x-cline-session-id,x-kelvin-session-id,x-session-id"
+
+  # --- durable local edge state (SQLite WAL) ------------------------------
+  EDGE_STATE_PERSISTENCE: "sqlite"
+  EDGE_STATE_DB_PATH: "${LOCALAPPDATA}/VIVERRA/LiteLLM/edge-state.sqlite3"
+  EDGE_CONTEXT_IDLE_TTL: "86400"
+  EDGE_IDLE_CLEANUP_INTERVAL_SECONDS: "300"
+
+proxy:
+  # Local listener. Single worker is MANDATORY for the edge profile
+  # (worker_guard fails startup with num_workers > 1 and no shared backend).
+  host: "127.0.0.1"
+  port: 4000
+  num_workers: 1
+
+runtime:
+  # Dedicated Python environment (relative to repo root or absolute).
+  python_env: ".venv/Scripts/python.exe"
+  # Append logs (never truncate previous diagnostics).
+  log_dir: "D:/_SATIN_AI_2/logs/litellm-edge"
+  pid_file: "D:/_SATIN_AI_2/logs/litellm-edge/litellm-edge.pid"
+  # Optional: probe the remote WAN capabilities endpoint after readiness.
+  probe_remote_capabilities: true
