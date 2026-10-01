@@ -72,16 +72,17 @@ function Read-EdgeConfigFile {
 
 function Resolve-EdgeEnvValue {
     param([string]$Value, [string]$Name)
-    # ${VAR} -> process environment when set; otherwise keep the literal.
-    if ($Value -match '^\$\{(?<var>[A-Za-z0-9_]+)\}$') {
-        $var = $matches['var']
-        $envValue = [System.Environment]::GetEnvironmentVariable($var)
+    # ${VAR} -> process environment when set; expands EVERY occurrence
+    # (also suffixed forms like "${LOCALAPPDATA}/VIVERRA/..."); keeps the
+    # literal ${VAR} text when the variable is unset.
+    return [regex]::Replace($Value, '\$\{(?<var>[A-Za-z0-9_]+)\}', {
+        param($m)
+        $envValue = [System.Environment]::GetEnvironmentVariable($m.Groups['var'].Value)
         if ($null -ne $envValue -and $envValue -ne '') {
             return $envValue
         }
-        return $Value  # keep the ${VAR} marker; caller decides how to report
-    }
-    return $Value
+        return $m.Value
+    })
 }
 
 function Export-EdgeEnvBlock {

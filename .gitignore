@@ -150,3 +150,10 @@ config/edge-production.local.yml
 config/edge-proxy.local.yaml
 config/edge-proxy.local.yml
 *.pid
+
+# ---- SQLite edge-state runtime DBs (never commit) ----
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+/
