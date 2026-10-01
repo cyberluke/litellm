@@ -676,7 +676,6 @@ class TestAutoRouterBenchmarks:
         saved_spend=30.0,
         savings_estimated_turns=40,
         savings_estimated_actual_spend=10.0,
-        savings_estimated_classifier_cost=0.4,
         savings_estimated_saved_spend=30.0,
         classifier_cost=0.4,
         classifier_cost_recorded_turns=40,
@@ -702,7 +701,6 @@ class TestAutoRouterBenchmarks:
         assert totals.avg_tokens_per_session == 1000.0
         assert totals.baseline_spend == 40.0
         assert totals.saved_pct == 75.0
-        assert totals.savings_estimated_classifier_cost == 0.4
         assert totals.saved_per_session == 7.5
         assert totals.cache.coverage_pct == 95.0
         assert totals.cache.hit_rate_pct == pytest.approx(73.7)
@@ -722,7 +720,9 @@ class TestAutoRouterBenchmarks:
         assert totals.classifier_cost == 0.4
 
     @pytest.mark.parametrize("estimated_turns", [0, 4])
-    def test_recorded_savings_survive_when_historical_comparison_costs_are_missing(self, estimated_turns: int) -> None:
+    def test_historical_savings_without_recorded_baselines_still_compare_against_all_spend(
+        self, estimated_turns: int
+    ) -> None:
         from litellm.proxy.management_endpoints.auto_router_endpoints import _benchmark_totals
 
         row: Final = self.ROW.model_copy(
@@ -736,9 +736,9 @@ class TestAutoRouterBenchmarks:
         assert totals.spend == 10.0
         assert totals.savings_estimated_turns == estimated_turns
         assert totals.saved_spend == 30.0
-        assert totals.baseline_spend is None
-        assert totals.savings_estimated_classifier_cost is None
-        assert totals.saved_pct is None
+        assert totals.baseline_spend == 40.0
+        assert totals.saved_pct == 75.0
+        assert totals.classifier_cost == 0.4
         assert totals.saved_per_session == 7.5
 
     def test_an_empty_window_folds_to_zeros(self):
@@ -768,7 +768,6 @@ class TestAutoRouterBenchmarks:
                 "spend": 0.0,
                 "savings_estimated_turns": 10,
                 "savings_estimated_actual_spend": 0.0,
-                "savings_estimated_classifier_cost": 0.0,
             }
         )
         summed = _summed_agg_row([self.ROW, other])
@@ -777,9 +776,6 @@ class TestAutoRouterBenchmarks:
         assert summed.turns == 50
         assert totals.avg_turns_per_session == 10.0
         assert totals.spend == 10.0
-        assert totals.savings_estimated_classifier_cost == 0.4
-        unknown_cost = other.model_copy(update={"savings_estimated_classifier_cost": None})
-        assert _benchmark_totals(_summed_agg_row([self.ROW, unknown_cost])).savings_estimated_classifier_cost is None
 
     def test_tier_names_stay_scoped_to_the_router_type_that_recorded_them(self):
         quality = self.ROW.model_copy(
@@ -1138,8 +1134,10 @@ class TestAutoRouterSession:
             "saved_spend": 0.24,
             "savings_estimated_turns": 3 if estimated else 0,
             "savings_estimated_actual_spend": 0.14 if estimated else 0.0,
-            "baseline_spend": pytest.approx(0.38) if turns == 3 else None,
-            "savings_estimated_baseline_spend": pytest.approx(0.38) if turns == 3 else None,
+            "baseline_spend": pytest.approx(spend + 0.24),
+            "savings_estimated_baseline_spend": (
+                pytest.approx(0.38 if turns == 3 else 0.10) if estimated else None
+            ),
             "baseline_model": "anthropic/claude-opus-5",
             "baseline_models": {"anthropic/claude-opus-5": 3},
         }

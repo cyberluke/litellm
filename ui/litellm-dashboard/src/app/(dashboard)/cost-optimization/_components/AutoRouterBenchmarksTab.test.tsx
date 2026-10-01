@@ -158,19 +158,20 @@ describe("AutoRouterBenchmarksTab", () => {
   });
 
   it.each([
-    { estimatedTurns: 0, actual: 0, saved: null, pct: null },
-    { estimatedTurns: 0, actual: 0, saved: 30, pct: null },
-    { estimatedTurns: 10, actual: 2, saved: -0.5, pct: -33.3 },
-    { estimatedTurns: 10, actual: 2, saved: 0, pct: 0 },
-    { estimatedTurns: 40, actual: 10, saved: 30, pct: 75 },
-  ])("compares matching old and new requests with savings $saved", ({ estimatedTurns, actual, saved, pct }) => {
+    { estimatedTurns: 0, saved: null, pct: null },
+    { estimatedTurns: 0, saved: 30, pct: 23.3 },
+    { estimatedTurns: 10, saved: -0.5, pct: -0.5 },
+    { estimatedTurns: 10, saved: 0, pct: 0 },
+    { estimatedTurns: 3073, saved: 30, pct: 23.3 },
+  ])("compares all spend against spend plus recorded savings $saved", ({ estimatedTurns, saved, pct }) => {
+    const spend = 99;
     const comparison = {
-      spend: actual + 99,
+      spend,
+      classifier_cost: 0.1,
       savings_estimated_turns: estimatedTurns,
-      savings_estimated_actual_spend: actual,
-      savings_estimated_classifier_cost: 0.1,
+      savings_estimated_actual_spend: estimatedTurns ? 2 : 0,
       saved_spend: saved,
-      baseline_spend: estimatedTurns ? actual + (saved ?? 0) : null,
+      baseline_spend: saved == null ? null : spend + saved,
       saved_pct: pct,
       saved_per_session: null,
     };
@@ -180,27 +181,17 @@ describe("AutoRouterBenchmarksTab", () => {
     renderTab();
     expect(screen.getByText("Total estimated savings")).toBeInTheDocument();
     expect(screen.getAllByRole("definition").map((row) => row.textContent)).toEqual(
-      estimatedTurns
-        ? [
-            `$${actual.toFixed(2)}`,
-            `$${(actual - 0.1).toFixed(2)}`,
-            "$0.1000",
-            `$${(actual + (saved ?? 0)).toFixed(2)}`,
-          ]
-        : ["Unavailable", "Unavailable", "Unavailable", "Unavailable"],
+      saved == null
+        ? ["Unavailable", "Unavailable", "Unavailable", "Unavailable"]
+        : ["$99.00", "$98.90", "$0.1000", `$${(spend + saved).toFixed(2)}`],
     );
-    expect(screen.queryByText("Actual spend on covered turns")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Savings based on/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Matching cost details are unavailable/)).not.toBeInTheDocument();
     expect(screen.getByLabelText("question-circle")).toBeInTheDocument();
-    if (estimatedTurns) {
-      expect(screen.getByText(`Savings based on ${estimatedTurns} of 3,073 requests`)).toBeInTheDocument();
-      const sign = pct && pct > 0 ? "-" : "+";
-      const badge = pct === 0 ? "0%" : `${sign}${Math.abs(pct ?? 0).toFixed(0)}%`;
+    if (pct != null) {
+      const sign = pct > 0 ? "-" : "+";
+      const badge = pct === 0 ? "0%" : `${sign}${Math.abs(pct).toFixed(0)}%`;
       expect(screen.getByText(badge)).toBeInTheDocument();
-    } else if (saved != null) {
-      expect(screen.getByText("$30.00")).toBeInTheDocument();
-      expect(
-        screen.getByText("Historical savings are included. Matching cost details are unavailable."),
-      ).toBeInTheDocument();
     }
   });
 
@@ -256,20 +247,17 @@ describe("AutoRouterBenchmarksTab", () => {
     expect(screen.getAllByText("$10,126.28").length).toBeGreaterThan(0);
   });
 
-  it.each([null, undefined])(
-    "keeps eligible totals when the classification breakdown is %s",
-    (savings_estimated_classifier_cost) => {
-      const stats = totals({ savings_estimated_turns: 30, savings_estimated_classifier_cost });
-      mockHook({ data: response([group(stats)], stats) });
-      renderTab();
+  it("keeps totals when some usage predates classification-cost tracking", () => {
+    const stats = totals({ classifier_cost: null });
+    mockHook({ data: response([group(stats)], stats) });
+    renderTab();
 
-      expect(screen.getAllByText("Unavailable")).toHaveLength(2);
-      expect(screen.queryByText(/\/ 1K turns/)).not.toBeInTheDocument();
-      expect(screen.getByText("$359.86")).toBeInTheDocument();
-      expect(screen.getByText("$2,174.59")).toBeInTheDocument();
-      expect(screen.getByText(/some usage predates classification-cost tracking/)).toBeInTheDocument();
-    },
-  );
+    expect(screen.getAllByText("Unavailable")).toHaveLength(2);
+    expect(screen.queryByText(/\/ 1K turns/)).not.toBeInTheDocument();
+    expect(screen.getByText("$359.86")).toBeInTheDocument();
+    expect(screen.getByText("$2,174.59")).toBeInTheDocument();
+    expect(screen.getByText(/some usage predates classification-cost tracking/)).toBeInTheDocument();
+  });
 
   it("pairs the savings with the session count it was earned over, in its own tile", () => {
     mockHook({ data: response([group(), group({ router_name: "gpt-auto" })]) });
