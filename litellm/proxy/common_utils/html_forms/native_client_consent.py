@@ -21,6 +21,14 @@ def render_native_client_consent_page(
     title: Final = "Authorize application access" if hosted else "Authorize CLI access"
     client_type: Final = "A web application" if hosted else "A command-line client"
     renewal: Final = "" if hosted else " <code>lite logout</code> stops it from being renewed."
+    permission_text: Final = (
+        "Approving permits read-only model listings and aggregate usage reports within your current permissions. "
+        "It does not permit changes, credential access, request contents, or LLM calls. "
+        "Access expires after five minutes and can be renewed for up to 24 hours. "
+        "Disconnecting the application revokes access immediately."
+        if hosted
+        else f"Approving issues it a personal credential that expires within {CLI_JWT_EXPIRATION_HOURS} hours.{renewal}"
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -63,7 +71,7 @@ button {{ flex: 1; padding: 10px; border-radius: 6px; font-size: 15px; cursor: p
 <div class="container">
 <h1>{title}</h1>
 <p>{client_type} at <code>{escape(client_origin)}</code> wants to call LiteLLM as <strong>{escape(user_id)}</strong>.</p>
-<p>Approving issues it a personal credential that expires within {CLI_JWT_EXPIRATION_HOURS} hours.{renewal} Only approve if you started this sign-in yourself.</p>
+<p>{permission_text} Only approve if you started this sign-in yourself.</p>
 <form method="post" action="{escape(complete_url)}">
 <input type="hidden" name="flow" value="{escape(flow_handle)}">
 {_team_field(teams)}

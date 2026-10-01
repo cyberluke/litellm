@@ -1,0 +1,285 @@
+import asyncio
+import hashlib
+from datetime import datetime, timedelta, timezone
+from typing import Final
+
+import pytest
+
+from litellm.proxy._experimental.mcp_server.hosted_proxy_auth import (
+    HOSTED_ACCESS_TTL,
+    HOSTED_GRANT_TTL,
+    MAX_HOSTED_REFRESHES,
+    HostedFailure,
+    HostedGrant,
+    HostedProxyAuth,
+    HostedTokens,
+)
+from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+
+NOW: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+CALLBACK: Final = "https://admin.example/oauth/callback"
+RESOURCE: Final = "https://gateway.example"
+
+
+class GrantStore:
+    def __init__(self) -> None:
+        self.grant: HostedGrant | None = None
+        self.issued: bool = False
+        self.spent: frozenset[str] = frozenset()
+        self.available: bool = True
+
+    async def read(self, grant_id: str) -> HostedGrant | HostedFailure:
+        if not self.available:
+            raise ConnectionError("store unavailable")
+        return self.grant if self.grant is not None and self.grant.grant_id == grant_id else HostedFailure()
+
+    async def replace(self, grant: HostedGrant, previous: HostedGrant | None, ttl: int) -> bool:
+        if not self.available:
+            raise ConnectionError("store unavailable")
+        if self.grant != previous or (previous is None and self.issued):
+            return False
+        if previous is not None:
+            self.spent = self.spent | frozenset({previous.refresh_hash})
+        self.grant = grant
+        self.issued = True
+        return True
+
+    async def delete(self, grant_id: str) -> None:
+        if not self.available:
+            raise ConnectionError("store unavailable")
+        if self.grant is not None and self.grant.grant_id == grant_id:
+            self.grant = None
+
+    async def revoke_replayed(self, grant_id: str, token_hash: str) -> None:
+        if not self.available:
+            raise ConnectionError("store unavailable")
+        if token_hash in self.spent:
+            await self.delete(grant_id)
+
+
+class UserLoader:
+    def __init__(self) -> None:
+        self.role = LitellmUserRoles.PROXY_ADMIN
+        self.active = True
+
+    async def __call__(self, user_id: str, team_id: str | None) -> UserAPIKeyAuth | HostedFailure:
+        if not self.active:
+            return HostedFailure()
+        return UserAPIKeyAuth(user_id=user_id, team_id=team_id, user_role=self.role)
+
+
+@pytest.fixture(autouse=True)
+def trusted_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS", CALLBACK)
+
+
+async def issued(service: HostedProxyAuth) -> HostedTokens:
+    result: Final = await service.issue("user", "team", "client", CALLBACK, RESOURCE, "code-id")
+    assert isinstance(result, HostedTokens), result
+    return result
+
+
+@pytest.mark.asyncio
+async def test_tokens_are_opaque_and_only_hashes_are_stored() -> None:
+    store: Final = GrantStore()
+    tokens: Final = await issued(HostedProxyAuth(store, UserLoader(), NOW))
+    assert store.grant is not None
+    assert store.grant.access_hash == hashlib.sha256(tokens.access_token.encode()).hexdigest()
+    assert store.grant.refresh_hash == hashlib.sha256(tokens.refresh_token.encode()).hexdigest()
+    assert tokens.access_token not in store.grant.model_dump_json()
+    assert tokens.refresh_token not in store.grant.model_dump_json()
+    assert tokens.expires_in == HOSTED_ACCESS_TTL
+    assert tokens.scope == "proxy:read"
+    assert tokens.access_token not in repr(tokens)
+    assert tokens.refresh_token not in repr(tokens)
+
+
+@pytest.mark.asyncio
+async def test_store_outage_fails_closed_and_does_not_consume_authorization_code() -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    store.available = False
+    failed: Final = await service.issue("user", "team", "client", CALLBACK, RESOURCE, "code-id")
+    assert isinstance(failed, HostedFailure)
+    assert failed.error == "temporarily_unavailable"
+    store.available = True
+    tokens: Final = await issued(service)
+    store.available = False
+    access: Final = await service.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET")
+    refresh: Final = await service.refresh(tokens.refresh_token, "client", RESOURCE)
+    revoke: Final = await service.revoke(tokens.refresh_token, "client")
+    assert isinstance(access, HostedFailure) and access.error == "temporarily_unavailable"
+    assert isinstance(refresh, HostedFailure) and refresh.error == "temporarily_unavailable"
+    assert isinstance(revoke, HostedFailure) and revoke.error == "temporarily_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "method"),
+    [
+        ("/key/generate", "POST"),
+        ("/key/info", "GET"),
+        ("/model/info", "GET"),
+        ("/config/yaml", "GET"),
+        ("/spend/logs", "GET"),
+        ("/v1/chat/completions", "POST"),
+        ("/mcp", "GET"),
+        ("/sso/key/generate", "GET"),
+        ("/global/spend", "POST"),
+        ("/v1/models/../key/info", "GET"),
+    ],
+)
+async def test_read_only_admin_token_cannot_write_read_secrets_or_call_llms(route: str, method: str) -> None:
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    result: Final = await service.authenticate(tokens.access_token, RESOURCE, route, method)
+    assert isinstance(result, HostedFailure)
+    assert result.error == "insufficient_scope"
+
+
+@pytest.mark.asyncio
+async def test_read_only_authority_tracks_live_user_role_and_deactivation() -> None:
+    loader: Final = UserLoader()
+    service: Final = HostedProxyAuth(GrantStore(), loader, NOW)
+    tokens: Final = await issued(service)
+    assert isinstance(await service.authenticate(tokens.access_token, RESOURCE, "/global/spend", "GET"), UserAPIKeyAuth)
+    loader.role = LitellmUserRoles.INTERNAL_USER
+    denied: Final = await service.authenticate(tokens.access_token, RESOURCE, "/global/spend", "GET")
+    assert isinstance(denied, HostedFailure)
+    assert denied.error == "insufficient_scope"
+    models: Final = await service.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET")
+    assert isinstance(models, UserAPIKeyAuth)
+    assert models.user_role == LitellmUserRoles.INTERNAL_USER
+    loader.active = False
+    assert isinstance(await service.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+    assert isinstance(await service.refresh(tokens.refresh_token, "client", RESOURCE), HostedFailure)
+
+
+@pytest.mark.asyncio
+async def test_removed_callback_stops_active_access_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    monkeypatch.delenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS")
+    assert isinstance(await service.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+    assert isinstance(await service.refresh(tokens.refresh_token, "client", RESOURCE), HostedFailure)
+
+
+@pytest.mark.asyncio
+async def test_rotation_does_not_extend_absolute_grant_lifetime() -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    later: Final = HostedProxyAuth(store, UserLoader(), NOW + timedelta(seconds=HOSTED_GRANT_TTL - 10))
+    rotated: Final = await later.refresh(tokens.refresh_token, "client", RESOURCE)
+    assert isinstance(rotated, HostedTokens)
+    assert rotated.expires_in == 10
+    expired: Final = HostedProxyAuth(store, UserLoader(), NOW + timedelta(seconds=HOSTED_GRANT_TTL))
+    assert isinstance(await expired.refresh(rotated.refresh_token, "client", RESOURCE), HostedFailure)
+    assert isinstance(await expired.authenticate(rotated.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refresh_is_single_use_and_revokes_the_compromised_family() -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    first_loaded: Final = asyncio.Event()
+    both_loaded: Final = asyncio.Event()
+
+    async def simultaneous_user_load(user_id: str, team_id: str | None) -> UserAPIKeyAuth:
+        if first_loaded.is_set():
+            both_loaded.set()
+        else:
+            first_loaded.set()
+        await both_loaded.wait()
+        return UserAPIKeyAuth(user_id=user_id, team_id=team_id, user_role=LitellmUserRoles.PROXY_ADMIN)
+
+    racer: Final = HostedProxyAuth(store, simultaneous_user_load, NOW)
+    results: Final = await asyncio.gather(
+        racer.refresh(tokens.refresh_token, "client", RESOURCE),
+        racer.refresh(tokens.refresh_token, "client", RESOURCE),
+    )
+    successes: Final = tuple(result for result in results if isinstance(result, HostedTokens))
+    assert len(successes) == 1
+    assert sum(isinstance(result, HostedFailure) for result in results) == 1
+    assert isinstance(
+        await service.authenticate(successes[0].access_token, RESOURCE, "/v1/models", "GET"), HostedFailure
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_replay_revokes_family_but_random_secret_does_not() -> None:
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    rotated: Final = await service.refresh(tokens.refresh_token, "client", RESOURCE)
+    assert isinstance(rotated, HostedTokens)
+    forged: Final = rotated.refresh_token[:-43] + "x" * 43
+    assert isinstance(await service.refresh(forged, "client", RESOURCE), HostedFailure)
+    assert isinstance(await service.authenticate(rotated.access_token, RESOURCE, "/v1/models", "GET"), UserAPIKeyAuth)
+    assert isinstance(await service.refresh(tokens.refresh_token, "client", RESOURCE), HostedFailure)
+    assert isinstance(await service.authenticate(rotated.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+
+
+@pytest.mark.asyncio
+async def test_revoking_grant_does_not_allow_authorization_code_reuse() -> None:
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    assert await service.revoke(tokens.refresh_token, "client") is None
+    assert isinstance(await service.issue("user", "team", "client", CALLBACK, RESOURCE, "code-id"), HostedFailure)
+
+
+@pytest.mark.asyncio
+async def test_refresh_history_is_bounded() -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    assert store.grant is not None
+    store.grant = store.grant.model_copy(update={"refresh_count": MAX_HOSTED_REFRESHES - 1})
+    rotated: Final = await service.refresh(tokens.refresh_token, "client", RESOURCE)
+    assert isinstance(rotated, HostedTokens)
+    assert store.grant.refresh_count == MAX_HOSTED_REFRESHES
+    response: Final = await service.refresh(rotated.refresh_token, "client", RESOURCE)
+    assert isinstance(response, HostedFailure)
+    assert response.error == "invalid_grant"
+    assert store.spent == frozenset({hashlib.sha256(tokens.refresh_token.encode()).hexdigest()})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_access_token", [False, True])
+async def test_revocation_removes_refresh_and_active_api_access(use_access_token: bool) -> None:
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    token: Final = tokens.access_token if use_access_token else tokens.refresh_token
+    assert await service.revoke(token, "different-client") is None
+    assert isinstance(await service.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET"), UserAPIKeyAuth)
+    assert await service.revoke(token, "client") is None
+    assert isinstance(await service.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+    assert isinstance(await service.refresh(tokens.refresh_token, "client", RESOURCE), HostedFailure)
+
+
+@pytest.mark.asyncio
+async def test_tokens_cannot_cross_client_gateway_or_token_kind_boundaries() -> None:
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    assert isinstance(await service.refresh(tokens.refresh_token, "other-client", RESOURCE), HostedFailure)
+    assert isinstance(await service.refresh(tokens.refresh_token, "client", "https://other.example"), HostedFailure)
+    assert isinstance(await service.refresh(tokens.access_token, "client", RESOURCE), HostedFailure)
+    assert isinstance(await service.authenticate(tokens.refresh_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+    assert isinstance(
+        await service.authenticate(tokens.access_token, "https://other.example", "/v1/models", "GET"), HostedFailure
+    )
+
+
+@pytest.mark.asyncio
+async def test_expired_access_requires_refresh_and_missing_store_grant_fails_closed() -> None:
+    store: Final = GrantStore()
+    service: Final = HostedProxyAuth(store, UserLoader(), NOW)
+    tokens: Final = await issued(service)
+    expired: Final = HostedProxyAuth(store, UserLoader(), NOW + timedelta(seconds=HOSTED_ACCESS_TTL))
+    assert isinstance(await expired.authenticate(tokens.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+    rotated: Final = await expired.refresh(tokens.refresh_token, "client", RESOURCE)
+    assert isinstance(rotated, HostedTokens)
+    assert isinstance(await expired.authenticate(rotated.access_token, RESOURCE, "/v1/models", "GET"), UserAPIKeyAuth)
+    store.grant = None
+    assert isinstance(await expired.authenticate(rotated.access_token, RESOURCE, "/v1/models", "GET"), HostedFailure)
+    assert isinstance(await expired.refresh(rotated.refresh_token, "client", RESOURCE), HostedFailure)

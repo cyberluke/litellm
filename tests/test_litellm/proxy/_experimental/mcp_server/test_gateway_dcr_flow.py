@@ -53,6 +53,7 @@ from litellm.proxy._experimental.mcp_server.outbound_credentials.session_credent
 from litellm.proxy._experimental.mcp_server.outbound_credentials.session_token import (
     SESSION_ISSUER,
     SESSION_REFRESH_PREFIX,
+    MintedSessionToken,
     SessionPrincipal,
     mint_session_refresh_token,
     mint_session_token,
@@ -113,7 +114,7 @@ async def _reload_user_active(user_id: str):
 async def test_register_mints_stateless_public_client():
     body = await _register([REDIRECT_URI])
     assert body["token_endpoint_auth_method"] == "none"
-    assert body["grant_types"] == ["authorization_code", "refresh_token", TOKEN_EXCHANGE_GRANT_TYPE]
+    assert body["grant_types"] == ["authorization_code", "refresh_token"]
     assert "client_secret" not in body
     assert body["redirect_uris"] == [REDIRECT_URI]
     assert is_gateway_dcr_client_id(body["client_id"])
@@ -1562,6 +1563,10 @@ async def test_explicit_hosted_callback_preserves_consent_pkce_identity_and_one_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     hosted: Final = "https://admin.example/oauth/callback"
+    from litellm.proxy._experimental.mcp_server.hosted_proxy_auth import HostedProxyAuth
+    from tests.unit.proxy._experimental.mcp_server.test_hosted_proxy_auth import GrantStore, NOW, UserLoader
+
+    service: Final = HostedProxyAuth(GrantStore(), UserLoader(), NOW)
     monkeypatch.setenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS", hosted)
     client_id: Final = (await _register([hosted]))["client_id"]
     login: Final = await _native_authorize(client_id, redirect_uri=hosted, session_user_id=None)
@@ -1596,10 +1601,13 @@ async def test_explicit_hosted_callback_preserves_consent_pkce_identity_and_one_
         cache=cache,
         resource=PROXY_API_RESOURCE,
         mint_proxy_credential=minter,
+        hosted_auth=service,
     )
     assert redeemed.status_code == 200
     assert json.loads(redeemed.body)["user_id"] == "u1"
     assert json.loads(redeemed.body)["team_id"] == "team-b"
+    assert json.loads(redeemed.body)["scope"] == "proxy:read"
+    assert minter.calls == []
     replay: Final = await _redeem(
         code,
         client_id,
@@ -1607,9 +1615,38 @@ async def test_explicit_hosted_callback_preserves_consent_pkce_identity_and_one_
         cache=cache,
         resource=PROXY_API_RESOURCE,
         mint_proxy_credential=minter,
+        hosted_auth=service,
     )
     assert replay.status_code == 400
     assert json.loads(replay.body)["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_removed_hosted_callback_cannot_receive_a_pending_consent_redirect(monkeypatch: pytest.MonkeyPatch, decision: str) -> None:
+    hosted: Final = "https://admin.example/oauth/callback"
+    monkeypatch.setenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS", hosted)
+    client_id: Final = (await _register([hosted]))["client_id"]
+    consent: Final = await _native_authorize(client_id, redirect_uri=hosted)
+    monkeypatch.delenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS")
+    response: Final = await _complete_consent(consent, cache=DualCache(), decision=decision)
+    assert response.status_code == 400
+    assert "location" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_removed_hosted_callback_cannot_redeem_a_pending_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    hosted: Final = "https://admin.example/oauth/callback"
+    monkeypatch.setenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS", hosted)
+    client_id: Final = (await _register([hosted]))["client_id"]
+    consent: Final = await _native_authorize(client_id, redirect_uri=hosted)
+    approved: Final = await _complete_consent(consent, cache=DualCache(), decision="approve")
+    monkeypatch.delenv("LITELLM_PROXY_API_OAUTH_REDIRECT_URIS")
+    minter: Final = _Minter()
+    response: Final = await _redeem(_code_from(approved), client_id, redirect_uri=hosted, mint_proxy_credential=minter)
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "invalid_grant"
+    assert minter.calls == []
 
 
 @pytest.mark.asyncio
@@ -2305,6 +2342,33 @@ async def _exchange_native(client_id, minter, exchanger, cache=None, **overrides
         "exchange_subject_token": exchanger,
     }
     return await _redeem_native(None, client_id, minter, cache=cache, **{**arguments, **overrides})
+
+
+@pytest.mark.asyncio
+async def test_hosted_registration_cannot_exchange_an_idp_token_for_a_personal_credential() -> None:
+    client_id: Final = (await _register(["https://admin.example/oauth/callback"]))["client_id"]
+    minter: Final = _Minter()
+    exchanger: Final = _Exchanger()
+    response: Final = await _exchange_native(client_id, minter, exchanger)
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "unauthorized_client"
+    assert minter.calls == []
+    assert exchanger.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_hosted_refresh_cannot_renew_a_personal_credential() -> None:
+    client_id: Final = (await _register(["https://admin.example/oauth/callback"]))["client_id"]
+    refresh: Final = mint_session_refresh_token(
+        SessionPrincipal(user_id="u1", client_id=client_id, audience="proxy_api", team_id="team-b"),
+        session_keys_from_master_key(MASTER_KEY), datetime.now(timezone.utc),
+    )
+    assert isinstance(refresh, MintedSessionToken)
+    minter: Final = _Minter()
+    response: Final = await _refresh_native(refresh.token.get_secret_value(), client_id, minter, DualCache())
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "invalid_grant"
+    assert minter.calls == []
 
 
 @pytest.mark.asyncio
