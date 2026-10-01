@@ -35,10 +35,9 @@ function Read-EdgeConfigFile {
         $lineNo++
         $line = $rawLine.TrimEnd()
 
-        # strip comments outside values (only full-line and trailing comments
-        # preceded by whitespace are honored)
+        # strip full-line comments first
         $stripped = $line -replace '^\s*#.*$', ''
-        if ($stripped -match '^(?<indent>\s*)(?<name>[A-Za-z0-9_]+):\s*(?<value>.*)$') {
+        if ($stripped -match '^(?<indent>\s*)(?<name>[A-Za-z0-9_]+):\s*(?<value>[^#]*?)\s*(#.*)?$') {
             $indent = $matches['indent']
             $name = $matches['name']
             $value = $matches['value']
