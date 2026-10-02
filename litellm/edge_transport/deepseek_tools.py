@@ -17,6 +17,7 @@ The bars in the markup may be ASCII ``|`` or the tokenizer's fullwidth variant
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from typing import Any, Optional
@@ -24,17 +25,14 @@ from typing import Any, Optional
 # A tag like <|DSML|tool_calls|> with any delimiter characters between < >.
 _TAG = re.compile(r"<([^>]*)>")
 _BLOCK_START = re.compile(r"<\s*([^>]*)DSML[^>]*tool_calls[^>]*>", re.IGNORECASE)
-_BLOCK_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*tool_calls[^>]*>", re.IGNORECASE)
 _INVOKE_START = re.compile(
     r"<\s*([^>]*)DSML[^>]*(?:tool\s+)?invoke(?:\s+(?:name|invoke))?\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
     re.IGNORECASE,
 )
-_INVOKE_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*invoke[^>]*>", re.IGNORECASE)
 _PARAM_START = re.compile(
     r"<\s*([^>]*)DSML[^>]*parameter\s+(?:name|parameter)\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
     re.IGNORECASE,
 )
-_PARAM_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*parameter[^>]*>", re.IGNORECASE)
 
 # The model sometimes emits the tool call as a bare JSON array instead of the
 # DSML markup, e.g.:
@@ -44,31 +42,109 @@ _PARAM_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*parameter[^>]*>", re.IGNORECAS
 # "name" and "parameters" object.
 _JSON_ARRAY = re.compile(r"\[[\s\S]*?\]")
 
+# The model also emits a plain XML tool-call block (observed live, 2026-10-02):
+#   <tool_calls>
+#     <invoke name="read">
+#       <parameter name="filePath" string="true">C:/temp/foo.py</parameter>
+#       <parameter name="offset" string="false">1</parameter>
+#     </invoke>
+#   </tool_calls>
+# The optional ``string="true|false"`` attribute is the model's type hint; the
+# value is additionally JSON-coerced so numbers stay numbers.
+_XML_BLOCK_START = re.compile(r"<\s*([^>]*)tool_calls[^>]*>", re.IGNORECASE)
+_XML_BLOCK_END = re.compile(r"<\s*/\s*([^>]*)tool_calls[^>]*>", re.IGNORECASE)
+_XML_INVOKE = re.compile(
+    r"<\s*([^>]*)invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>", re.IGNORECASE
+)
+_XML_PARAM = re.compile(
+    r"<\s*([^>]*)parameter\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)"
+    r"<\s*/\s*([^>]*)parameter[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _find_json_array(text: str, start: int = 0) -> Optional[tuple[int, int]]:
+    """Return (start, end) of the next balanced JSON array in ``text``,
+    honoring string quotes and escapes (the naive non-greedy regex breaks on
+    nested arrays such as a JSON-encoded ``todos`` string)."""
+    i = text.find("[", start)
+    while i != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < len(text):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        return i, j + 1
+            j += 1
+        i = text.find("[", i + 1)
+    return None
+
 
 def _find_tag(text: str, pattern: re.Pattern[str], start: int = 0) -> Optional[re.Match[str]]:
     return pattern.search(text, start)
 
 
+def _find_end_tag(text: str, start: int, name: str) -> Optional[re.Match[str]]:
+    """Next DSML closing tag for ``name`` (parameter / invoke / tool_calls).
+    The model emits both ``</DSML|parameter|>`` and ``<|DSML|/parameter|>``;
+    accept any tag containing DSML + the name + a slash."""
+    for m in _TAG.finditer(text, start):
+        body = m.group(1)
+        if "DSML" in body and name in body and "/" in body:
+            return m
+    return None
+
+
 def _coerce_param_value(raw: str) -> Any:
-    """Parameter values from the DSML markup are raw text; the model encodes
+    """Parameter values from the markup are raw text; the model encodes
     structured values (arrays/objects) either directly (``[{...}]``) or as a
-    JSON-encoded string (``"[{\"content\": ...}]"``). Coerce to the real JSON
-    value so the client's schema validation (e.g. todowrite's ``todos`` array)
-    accepts the call. Plain strings stay strings (``pwd`` / ``"pwd"``)."""
-    stripped = raw.strip()
+    JSON-encoded string (``"[{\"content\": ...}]"``), sometimes with
+    HTML-escaped quotes (``&quot;``). Coerce to the real JSON value so the
+    client's schema validation (e.g. todowrite's ``todos`` array, numeric
+    ``offset``/``limit``/``timeout``) accepts the call. Plain strings stay
+    strings (``pwd`` / ``"pwd"`` / ``a &amp; b`` -> ``a & b``).
+
+    Order matters: parse the RAW text as JSON FIRST so backslash escapes
+    inside a JSON-encoded string survive (unescaping first would turn
+    ``\"`` into ``"`` and corrupt the inner JSON); unescape and retry only
+    for HTML-escaped output; then parse string values as inner JSON.
+    """
+    text = raw.strip()
     try:
-        value = json.loads(stripped)
+        value = json.loads(text)
     except (ValueError, TypeError):
-        return raw
+        unescaped = html.unescape(text)
+        if unescaped == text:
+            return text
+        try:
+            value = json.loads(unescaped)
+        except (ValueError, TypeError):
+            return unescaped
     if isinstance(value, str):
-        inner = value.strip()
+        inner = html.unescape(value).strip()
         try:
             inner_value = json.loads(inner)
         except (ValueError, TypeError):
-            return value
+            return inner
         if isinstance(inner_value, (dict, list)):
             return inner_value
-        return value
+        return inner
     return value
 
 
@@ -89,7 +165,7 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     if "DSML" in text:
         block = _BLOCK_START.search(text)
         if block is not None:
-            block_end = _BLOCK_END.search(text, block.end())
+            block_end = _find_end_tag(text, block.end(), "tool_calls")
             if block_end is None:
                 body = text[block.end():]
                 clean_text = text[:block.start()].strip()
@@ -104,7 +180,7 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
                 if invoke is None:
                     break
                 name = invoke.group(2).strip()
-                invoke_end_m = _INVOKE_END.search(body, invoke.end())
+                invoke_end_m = _find_end_tag(body, invoke.end(), "invoke")
                 invoke_end = invoke_end_m.start() if invoke_end_m is not None else len(body)
                 inner = body[invoke.end():invoke_end]
 
@@ -115,7 +191,7 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
                     if pm is None:
                         break
                     pname = pm.group(2).strip()
-                    pend_m = _PARAM_END.search(inner, pm.end())
+                    pend_m = _find_end_tag(inner, pm.end(), "parameter")
                     pend = pend_m.start() if pend_m is not None else len(inner)
                     value = _coerce_param_value(inner[pm.end():pend])
                     params[pname] = value
@@ -141,14 +217,64 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
             if calls:
                 return clean_text, calls
 
-    # 2) Bare JSON array fallback (model-native output, no DSML wrapper).
-    for m in _JSON_ARRAY.finditer(text):
-        raw = m.group(0)
+    # 2) Plain XML tool-call block (no DSML wrapper).
+    xml_block = _XML_BLOCK_START.search(text)
+    if xml_block is not None:
+        block_end = _XML_BLOCK_END.search(text, xml_block.end())
+        body = (
+            text[xml_block.end():block_end.start()]
+            if block_end is not None
+            else text[xml_block.end():]
+        )
+        xml_calls: list[dict[str, Any]] = []
+        for invoke in _XML_INVOKE.finditer(body):
+            name = invoke.group(2).strip()
+            inner = body[invoke.end():]
+            close = re.compile(
+                r"<\s*/\s*([^>]*)invoke[^>]*>", re.IGNORECASE
+            ).search(inner)
+            if close is not None:
+                inner = inner[: close.start()]
+            params: dict[str, Any] = {}
+            for pm in _XML_PARAM.finditer(inner):
+                pname = pm.group(2).strip()
+                pvalue = pm.group(3)
+                params[pname] = _coerce_param_value(pvalue)
+            if "cmd" in params and "command" not in params:
+                params["command"] = params.pop("cmd")
+            xml_calls.append(
+                {
+                    "id": f"call_{len(xml_calls) + 1}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(params, ensure_ascii=False, separators=(",", ":")),
+                    },
+                }
+            )
+        if xml_calls:
+            clean_text = (
+                (text[: xml_block.start()] + text[xml_block.end() :]).strip()
+                if block_end is not None
+                else text[: xml_block.start()].strip()
+            )
+            return clean_text, xml_calls
+
+    # 3) Bare JSON array fallback (model-native output, no DSML wrapper).
+    search_from = 0
+    while True:
+        span = _find_json_array(text, search_from)
+        if span is None:
+            break
+        m_start, m_end = span
+        raw = text[m_start:m_end]
         try:
             items = json.loads(raw)
         except (ValueError, TypeError):
+            search_from = m_start + 1
             continue
         if not isinstance(items, list) or not items:
+            search_from = m_start + 1
             continue
         parsed: list[dict[str, Any]] = []
         for item in items:
@@ -158,6 +284,11 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
             parameters = item.get("parameters")
             if not isinstance(name, str) or not isinstance(parameters, dict):
                 break
+            # Coerce stringified values ("1" -> 1, "[{...}]" -> list) so the
+            # client schema validation accepts the call.
+            coerced = {k: _coerce_param_value(v) for k, v in parameters.items()}
+            if "cmd" in coerced and "command" not in coerced:
+                coerced["command"] = coerced.pop("cmd")
             parsed.append(
                 {
                     "id": f"call_{len(parsed) + 1}",
@@ -165,13 +296,16 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
                     "function": {
                         "name": name,
                         "arguments": json.dumps(
-                            parameters, ensure_ascii=False, separators=(",", ":")
+                            coerced, ensure_ascii=False, separators=(",", ":")
                         ),
                     },
                 }
             )
         if parsed:
-            clean_text = (text[: m.start()] + text[m.end() :]).strip()
+            clean_text = (text[:m_start] + text[m_end:]).strip()
             return clean_text, parsed
+        # Not a valid tool-call array (e.g. stringified ``parameters`` or
+        # non-call objects): never re-loop on the same array — keep scanning.
+        search_from = m_end + 1
 
     return text, []
