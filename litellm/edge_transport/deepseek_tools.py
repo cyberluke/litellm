@@ -49,6 +49,29 @@ def _find_tag(text: str, pattern: re.Pattern[str], start: int = 0) -> Optional[r
     return pattern.search(text, start)
 
 
+def _coerce_param_value(raw: str) -> Any:
+    """Parameter values from the DSML markup are raw text; the model encodes
+    structured values (arrays/objects) either directly (``[{...}]``) or as a
+    JSON-encoded string (``"[{\"content\": ...}]"``). Coerce to the real JSON
+    value so the client's schema validation (e.g. todowrite's ``todos`` array)
+    accepts the call. Plain strings stay strings (``pwd`` / ``"pwd"``)."""
+    stripped = raw.strip()
+    try:
+        value = json.loads(stripped)
+    except (ValueError, TypeError):
+        return raw
+    if isinstance(value, str):
+        inner = value.strip()
+        try:
+            inner_value = json.loads(inner)
+        except (ValueError, TypeError):
+            return value
+        if isinstance(inner_value, (dict, list)):
+            return inner_value
+        return value
+    return value
+
+
 def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     """Extract DeepSeek tool-call markup from ``text``.
 
@@ -94,7 +117,7 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
                     pname = pm.group(2).strip()
                     pend_m = _PARAM_END.search(inner, pm.end())
                     pend = pend_m.start() if pend_m is not None else len(inner)
-                    value = inner[pm.end():pend].strip()
+                    value = _coerce_param_value(inner[pm.end():pend])
                     params[pname] = value
                     ppos = pm.end() if pend_m is None else pend_m.end()
 
