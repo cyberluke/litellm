@@ -160,7 +160,16 @@ class EdgeTransport:
         self._client = client or httpx.AsyncClient(
             http2=True,
             verify=config.verify_tls,
-            timeout=httpx.Timeout(config.timeout_seconds, connect=config.connect_timeout_seconds),
+            # 0 disables the bound (slow-network profile: a generation is
+            # never killed; the TCP/TLS connect gets a generous 120s default).
+            timeout=httpx.Timeout(
+                config.timeout_seconds if config.timeout_seconds > 0 else None,
+                connect=(
+                    config.connect_timeout_seconds
+                    if config.connect_timeout_seconds > 0
+                    else None
+                ),
+            ),
             limits=httpx.Limits(
                 max_connections=config.max_connections,
                 max_keepalive_connections=config.max_keepalive_connections,

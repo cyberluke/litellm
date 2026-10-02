@@ -83,8 +83,13 @@ class EdgeTransportConfig:
     # client-facing model name stays the route model. Empty = send the
     # client model name unchanged.
     upstream_model: str = ""
-    timeout_seconds: float = 600.0
-    connect_timeout_seconds: float = 10.0
+    # Slow-network profile (2026-10-02): 0 disables the bound entirely.
+    # timeout_seconds=0 -> NO total timeout: a generation is never killed,
+    # and a 3MB register over VDSL (with 50 agents) can legitimately take
+    # minutes. connect_timeout_seconds=120 covers a lossy VDSL TLS handshake
+    # (a 10s connect bound can kill the handshake on a slow line).
+    timeout_seconds: float = 0.0
+    connect_timeout_seconds: float = 120.0
     # Capabilities cache TTL (step 5 contract validation). Phase 3.5 §18:
     # additionally refreshed on startup, on server-epoch mismatch and on
     # capability/protocol errors — never per inference.
@@ -93,9 +98,12 @@ class EdgeTransportConfig:
     # tests use Caddy's internal CA and may set this to 0 (the HTTP/2
     # proof is the negotiated version, not the certificate).
     verify_tls: bool = True
-    # HTTPX pool bounds: persistent client, wide keepalive pool.
-    max_connections: int = 50
-    max_keepalive_connections: int = 20
+    # HTTPX pool bounds: persistent client, wide keepalive pool. 200 connections
+    # so 50+ agents never bottleneck on the pool (HTTP/2 multiplexing shares
+    # them further); 100 keepalive connections keep warm reuse without
+    # unbounded growth.
+    max_connections: int = 200
+    max_keepalive_connections: int = 100
     # Phase 3.5 §3/§5: durable local edge state. "sqlite" (default) is the
     # workstation profile; "memory" is for tests/throwaway runs. The
     # persistence lives HERE, never in the shared differential-context
@@ -130,14 +138,14 @@ def load_config() -> EdgeTransportConfig:
         ),
         route_model=os.environ.get("EDGE_SSEPROXY_ROUTE_MODEL", DEFAULT_ROUTE_MODEL),
         upstream_model=os.environ.get("EDGE_SSEPROXY_UPSTREAM_MODEL", "").strip(),
-        timeout_seconds=float(os.environ.get("EDGE_SSEPROXY_TIMEOUT_SECONDS", "600")),
-        connect_timeout_seconds=float(os.environ.get("EDGE_SSEPROXY_CONNECT_TIMEOUT_SECONDS", "10")),
+        timeout_seconds=float(os.environ.get("EDGE_SSEPROXY_TIMEOUT_SECONDS", "0")),
+        connect_timeout_seconds=float(os.environ.get("EDGE_SSEPROXY_CONNECT_TIMEOUT_SECONDS", "120")),
         capabilities_refresh_seconds=float(
             os.environ.get("EDGE_SSEPROXY_CAPABILITIES_REFRESH_SECONDS", "300")
         ),
         verify_tls=_env_bool("EDGE_SSEPROXY_VERIFY_TLS", True),
-        max_connections=_env_int("EDGE_SSEPROXY_MAX_CONNECTIONS", 50),
-        max_keepalive_connections=_env_int("EDGE_SSEPROXY_MAX_KEEPALIVE_CONNECTIONS", 20),
+        max_connections=_env_int("EDGE_SSEPROXY_MAX_CONNECTIONS", 200),
+        max_keepalive_connections=_env_int("EDGE_SSEPROXY_MAX_KEEPALIVE_CONNECTIONS", 100),
         state_persistence=os.environ.get("EDGE_STATE_PERSISTENCE", "sqlite").strip().lower(),
         state_db_path=os.environ.get("EDGE_STATE_DB_PATH") or default_state_db_path(),
         shared_state_backend=os.environ.get("EDGE_STATE_SHARED_BACKEND") or None,
