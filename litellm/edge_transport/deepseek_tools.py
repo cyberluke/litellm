@@ -26,14 +26,23 @@ _TAG = re.compile(r"<([^>]*)>")
 _BLOCK_START = re.compile(r"<\s*([^>]*)DSML[^>]*tool_calls[^>]*>", re.IGNORECASE)
 _BLOCK_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*tool_calls[^>]*>", re.IGNORECASE)
 _INVOKE_START = re.compile(
-    r"<\s*([^>]*)DSML[^>]*invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>", re.IGNORECASE
+    r"<\s*([^>]*)DSML[^>]*(?:tool\s+)?invoke(?:\s+(?:name|invoke))?\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
+    re.IGNORECASE,
 )
 _INVOKE_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*invoke[^>]*>", re.IGNORECASE)
 _PARAM_START = re.compile(
-    r"<\s*([^>]*)DSML[^>]*parameter\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
+    r"<\s*([^>]*)DSML[^>]*parameter\s+(?:name|parameter)\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
     re.IGNORECASE,
 )
 _PARAM_END = re.compile(r"<\s*/\s*([^>]*)DSML[^>]*parameter[^>]*>", re.IGNORECASE)
+
+# The model sometimes emits the tool call as a bare JSON array instead of the
+# DSML markup, e.g.:
+#   [{"name": "bash", "parameters": {"command": "pwd"}}]
+# (the engine's own deepseekv4 parser leaves this unparsed too). The array may
+# be wrapped in prose. Extract the first JSON array whose items carry a
+# "name" and "parameters" object.
+_JSON_ARRAY = re.compile(r"\[[\s\S]*?\]")
 
 
 def _find_tag(text: str, pattern: re.Pattern[str], start: int = 0) -> Optional[re.Match[str]]:
@@ -50,56 +59,96 @@ def parse_deepseek_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
       (``id`` / ``type`` / ``function.{name, arguments}``); empty when no
       markup is present.
     """
-    if not text or "DSML" not in text:
+    if not text:
         return text, []
 
-    block = _BLOCK_START.search(text)
-    if block is None:
-        return text, []
-    block_start = block.start()
-    # End of the whole block: the first closing tool_calls tag at or after
-    # the opening tag.
-    block_end = _BLOCK_END.search(text, block.end())
-    if block_end is None:
-        # Unterminated block — treat the rest of the text as the block.
-        body = text[block.end():]
-        clean_text = text[:block_start].strip()
-    else:
-        body = text[block.end():block_end.start()]
-        clean_text = (text[:block_start] + text[block_end.end():]).strip()
+    # 1) DSML markup block.
+    if "DSML" in text:
+        block = _BLOCK_START.search(text)
+        if block is not None:
+            block_end = _BLOCK_END.search(text, block.end())
+            if block_end is None:
+                body = text[block.end():]
+                clean_text = text[:block.start()].strip()
+            else:
+                body = text[block.end():block_end.start()]
+                clean_text = (text[:block.start()] + text[block_end.end():]).strip()
 
-    calls: list[dict[str, Any]] = []
-    pos = 0
-    while True:
-        invoke = _INVOKE_START.search(body, pos)
-        if invoke is None:
-            break
-        name = invoke.group(2).strip()
-        invoke_end_m = _INVOKE_END.search(body, invoke.end())
-        invoke_end = invoke_end_m.start() if invoke_end_m is not None else len(body)
-        inner = body[invoke.end():invoke_end]
+            calls: list[dict[str, Any]] = []
+            pos = 0
+            while True:
+                invoke = _INVOKE_START.search(body, pos)
+                if invoke is None:
+                    break
+                name = invoke.group(2).strip()
+                invoke_end_m = _INVOKE_END.search(body, invoke.end())
+                invoke_end = invoke_end_m.start() if invoke_end_m is not None else len(body)
+                inner = body[invoke.end():invoke_end]
 
-        params: dict[str, Any] = {}
-        ppos = 0
-        while True:
-            pm = _PARAM_START.search(inner, ppos)
-            if pm is None:
+                params: dict[str, Any] = {}
+                ppos = 0
+                while True:
+                    pm = _PARAM_START.search(inner, ppos)
+                    if pm is None:
+                        break
+                    pname = pm.group(2).strip()
+                    pend_m = _PARAM_END.search(inner, pm.end())
+                    pend = pend_m.start() if pend_m is not None else len(inner)
+                    value = inner[pm.end():pend].strip()
+                    params[pname] = value
+                    ppos = pm.end() if pend_m is None else pend_m.end()
+
+                # The model's native bash-tool parameter is sometimes "cmd"
+                # instead of the schema's "command"; map it so the client's
+                # tool validation accepts the call (guarded: only when the
+                # schema name is absent).
+                if "cmd" in params and "command" not in params:
+                    params["command"] = params.pop("cmd")
+
+                arguments = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+                calls.append(
+                    {
+                        "id": f"call_{len(calls) + 1}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                )
+                pos = invoke.end() if invoke_end_m is None else invoke_end_m.end()
+
+            if calls:
+                return clean_text, calls
+
+    # 2) Bare JSON array fallback (model-native output, no DSML wrapper).
+    for m in _JSON_ARRAY.finditer(text):
+        raw = m.group(0)
+        try:
+            items = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(items, list) or not items:
+            continue
+        parsed: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
                 break
-            pname = pm.group(2).strip()
-            pend_m = _PARAM_END.search(inner, pm.end())
-            pend = pend_m.start() if pend_m is not None else len(inner)
-            value = inner[pm.end():pend].strip()
-            params[pname] = value
-            ppos = pm.end() if pend_m is None else pend_m.end()
+            name = item.get("name")
+            parameters = item.get("parameters")
+            if not isinstance(name, str) or not isinstance(parameters, dict):
+                break
+            parsed.append(
+                {
+                    "id": f"call_{len(parsed) + 1}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(
+                            parameters, ensure_ascii=False, separators=(",", ":")
+                        ),
+                    },
+                }
+            )
+        if parsed:
+            clean_text = (text[: m.start()] + text[m.end() :]).strip()
+            return clean_text, parsed
 
-        arguments = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
-        calls.append(
-            {
-                "id": f"call_{len(calls) + 1}",
-                "type": "function",
-                "function": {"name": name, "arguments": arguments},
-            }
-        )
-        pos = invoke.end() if invoke_end_m is None else invoke_end_m.end()
-
-    return clean_text, calls
+    return text, []
