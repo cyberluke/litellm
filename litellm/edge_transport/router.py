@@ -214,14 +214,17 @@ async def route_edge_proxy(
             # output: DeepSeek tool calls arrive as <|DSML|...|> markup in
             # the content. Extract them into OpenAI tool_calls and strip the
             # markup so clients execute the calls instead of rendering the
-            # raw tokens.
-            from .deepseek_tools import parse_deepseek_tool_calls
+            # raw tokens. The client's tools schema makes the coercion
+            # schema-aware (string params like write.content stay strings).
+            from .deepseek_tools import _tool_param_types, parse_deepseek_tool_calls
+
+            param_types = _tool_param_types(data.get("tools"))
 
             choices = response.get("choices")
             if isinstance(choices, list) and choices and isinstance(choices[0], dict):
                 msg = choices[0].get("message")
                 if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-                    clean, calls = parse_deepseek_tool_calls(msg["content"])
+                    clean, calls = parse_deepseek_tool_calls(msg["content"], param_types)
                     if calls:
                         msg["content"] = clean
                         msg["tool_calls"] = calls
@@ -246,7 +249,12 @@ async def route_edge_proxy(
         # output). The full text is buffered, parsed at the end, and the
         # markup is re-emitted as OpenAI tool_calls deltas (the engine emits
         # the whole response in one frame, so buffering adds no latency).
-        from .deepseek_tools import parse_deepseek_tool_calls
+        from .deepseek_tools import _tool_param_types, parse_deepseek_tool_calls
+
+        # The client's tools schema drives the parameter coercion (string
+        # params such as write.content stay strings even when the content
+        # is itself JSON text).
+        param_types = _tool_param_types(data.get("tools"))
 
         text_parts: list[str] = []
         meta_info: dict[str, Any] = {}
@@ -309,7 +317,11 @@ async def route_edge_proxy(
                 finish = fr
 
         full_text = "".join(text_parts)
-        clean_text, tool_calls = parse_deepseek_tool_calls(full_text) if full_text else (full_text, [])
+        clean_text, tool_calls = (
+            parse_deepseek_tool_calls(full_text, param_types)
+            if full_text
+            else (full_text, [])
+        )
         if tool_calls:
             if clean_text:
                 yield _oai({"content": clean_text})
