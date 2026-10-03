@@ -64,6 +64,7 @@ _GENERATION_PARAM_KEYS = frozenset(
         "logit_bias",
         "metadata",
         "reasoning_effort",
+        "chat_template_kwargs",
         "stream_options",
         "timeout",
     }
@@ -301,6 +302,23 @@ async def route_edge_proxy(
                     )
                 }
                 return
+            # SSEProxy emits ordinary OpenAI chat.completion.chunk frames
+            # ({"choices": [{"delta": {"content": ...}}]}) on BOTH the
+            # stateless /v1/chat/completions fallback and the differential
+            # /v1/differential-context/chat/completions route. Accept that
+            # shape as well as the raw engine-native frame ({"text", ...}).
+            choices = chunk.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                choice = choices[0]
+                delta = choice.get("delta")
+                delta = delta if isinstance(delta, dict) else {}
+                dtext = delta.get("content")
+                if isinstance(dtext, str):
+                    text_parts.append(dtext)
+                fr = choice.get("finish_reason")
+                if isinstance(fr, str) and fr:
+                    finish = fr
+                continue
             text = chunk.get("text")
             meta = chunk.get("meta_info")
             meta = meta if isinstance(meta, dict) else {}
